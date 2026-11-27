@@ -31,19 +31,107 @@ static String wifiName, wifiPassword, btName, radioURL;
 static Preferences prefs;
 static WebServer setupServer(80);
 
+static void keyBox(int x,int y,int w,int h,const String &label) {
+  auto &d=M5.Display;
+  d.fillRoundRect(x,y,w-2,h-2,4,TFT_DARKGREY);
+  d.setTextColor(TFT_WHITE,TFT_DARKGREY);
+  d.setTextSize(1);
+  d.setCursor(x+4,y+h/2-4);
+  d.print(label);
+}
+static void heading(const String &label) {
+  M5.Display.fillScreen(TFT_BLACK);
+  M5.Display.setTextColor(TFT_CYAN,TFT_BLACK);
+  M5.Display.setTextSize(2);
+  M5.Display.setCursor(8,8);
+  M5.Display.print(label);
+}
+static void tap(int &x,int &y) {
+  while(true) {
+    M5.update();
+    if(M5.Touch.getCount()) {
+      auto t=M5.Touch.getDetail(0);
+      if(t.wasPressed()) { x=t.x; y=t.y; return; }
+    }
+    delay(15);
+  }
+}
+static String keyboard(const String &label,String value,bool secret=false) {
+  int mode=0;
+  const char *rows[3][4]={{"1234567890","qwertyuiop","asdfghjkl","zxcvbnm.-/"},{"1234567890","QWERTYUIOP","ASDFGHJKL","ZXCVBNM.-/"},{"!@#$%^&*()","_+=:;?,~|","[]{}<>\\`","'\\" .-/"}};
+  while(true) {
+    heading(label);
+    String shown=value;
+    if(secret) { shown=""; for(size_t i=0;i<value.length();++i) shown+="*"; }
+    if(shown.length()>48) shown=shown.substring(shown.length()-48);
+    M5.Display.setTextSize(1); M5.Display.setCursor(8,38); M5.Display.print(shown);
+    for(int r=0;r<4;r++) for(int c=0;c<(int)strlen(rows[mode][r]);c++) keyBox(c*32,60+r*34,32,34,String(rows[mode][r][c]));
+    keyBox(0,200,64,40,"ABC/#"); keyBox(64,200,80,40,"SPACE"); keyBox(144,200,64,40,"DEL"); keyBox(208,200,112,40,"OK");
+    int x,y; tap(x,y);
+    if(y>=200) {
+      if(x<64) mode=(mode+1)%3;
+      else if(x<144) { if(value.length()<128) value+=' '; }
+      else if(x<208) { if(value.length()) value.remove(value.length()-1); }
+      else return value;
+    } else if(y>=60 && y<196) {
+      int r=(y-60)/34,c=x/32;
+      if(c>=0 && c<(int)strlen(rows[mode][r]) && value.length()<128) value+=rows[mode][r][c];
+    }
+  }
+}
+static String chooseWifi() {
+  heading("Scanning Wi-Fi...");
+  WiFi.mode(WIFI_STA);
+  int n=WiFi.scanNetworks();
+  int page=0;
+  while(true) {
+    heading("Select Wi-Fi");
+    for(int i=0;i<4 && page+i<n;i++) keyBox(4,35+i*40,312,40,WiFi.SSID(page+i));
+    keyBox(0,200,70,40,"PREV"); keyBox(70,200,70,40,"NEXT"); keyBox(140,200,180,40,"MANUAL SSID");
+    int x,y; tap(x,y);
+    if(y>=200) {
+      if(x<70) page=max(0,page-4);
+      else if(x<140) { if(page+4<n) page+=4; }
+      else { WiFi.scanDelete(); return keyboard("Wi-Fi SSID",""); }
+    } else if(y>=35 && y<195 && page+(y-35)/40<n) {
+      String ssid=WiFi.SSID(page+(y-35)/40); WiFi.scanDelete(); return ssid;
+    }
+  }
+}
+static bool lcdSetup() {
+  while(true) {
+    heading("AWC Radio Settings");
+    keyBox(4,35,312,38,"Wi-Fi: "+wifiName);
+    keyBox(4,75,312,38,"Bluetooth: "+btName);
+    keyBox(4,115,312,38,"Server: "+radioURL);
+    keyBox(4,155,312,38,"Save and restart");
+    keyBox(4,195,312,42,"Phone setup (optional)");
+    int x,y; tap(x,y);
+    if(y>=35 && y<75) { wifiName=chooseWifi(); wifiPassword=keyboard("Wi-Fi password","",true); }
+    else if(y>=75 && y<115) btName=keyboard("Bluetooth name",btName=="YOUR_CAR_BLUETOOTH_NAME"?"":btName);
+    else if(y>=115 && y<155) radioURL=keyboard("Radio server URL",radioURL);
+    else if(y>=155 && y<195) {
+      if(!wifiName.length() || wifiName=="YOUR_IPHONE_HOTSPOT" || !btName.length() || btName=="YOUR_CAR_BLUETOOTH_NAME" || !radioURL.startsWith("http://")) { heading("Check settings"); delay(1200); continue; }
+      prefs.putString("ssid",wifiName); prefs.putString("password",wifiPassword); prefs.putString("bt",btName); prefs.putString("url",radioURL);
+      prefs.end(); ESP.restart(); return true;
+    } else if(y>=195) return false;
+  }
+}
 static void configureDevice() {
   prefs.begin("awc-radio", false);
   wifiName = prefs.getString("ssid", WIFI_SSID);
   wifiPassword = prefs.getString("password", WIFI_PASSWORD);
   btName = prefs.getString("bt", BT_SPEAKER_NAME);
   radioURL = prefs.getString("url", RADIO_SERVER_URL);
+  bool forceSetup=prefs.getBool("setup",false); prefs.remove("setup");
   // Hold the touchscreen during startup to reopen setup.
   delay(600);
   M5.update();
-  if (wifiName != "YOUR_IPHONE_HOTSPOT" && btName != "YOUR_CAR_BLUETOOTH_NAME" && !M5.Touch.getCount()) {
+  if (wifiName != "YOUR_IPHONE_HOTSPOT" && btName != "YOUR_CAR_BLUETOOTH_NAME" && !M5.Touch.getCount() && !forceSetup) {
     prefs.end();
     return;
   }
+  if(lcdSetup()) return;
   WiFi.mode(WIFI_AP);
   String apPassword = String((uint32_t)esp_random(), HEX);
   while (apPassword.length() < 8) apPassword = "0" + apPassword;
@@ -246,6 +334,7 @@ static void drawScreen() {
   d.setTextSize(2);
   d.setCursor(12, 12);
   d.print("AWC RADIO");
+  keyBox(244,4,76,32,"SETTINGS");
   d.setTextColor(TFT_WHITE, TFT_BLACK);
   d.setCursor(12, 48);
   d.print(stationCount ? stationNames[stationIndex] : "Loading stations...");
@@ -317,6 +406,9 @@ void loop() {
   if (M5.Touch.getCount()) {
     auto detail = M5.Touch.getDetail(0);
     if (detail.wasPressed()) {
+      if (detail.y < 35 && detail.x >= 244) {
+        prefs.begin("awc-radio",false); prefs.putBool("setup",true); prefs.end(); ESP.restart();
+      }
       if (detail.y > 185) {
         if (detail.x < 110) selectStation(-1);
         else if (detail.x > 220) selectStation(1);
