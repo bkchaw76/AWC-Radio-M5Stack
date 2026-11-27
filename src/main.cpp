@@ -3,6 +3,9 @@
 #include <HTTPClient.h>
 #include <Preferences.h>
 #include <WebServer.h>
+#include <Update.h>
+#include <esp_ota_ops.h>
+#include <esp_system.h>
 #include <ArduinoJson.h>
 #include <M5Unified.h>
 #include <BluetoothA2DPSource.h>
@@ -610,6 +613,77 @@ static void savePower() {
   prefs.putInt("timeout",screenTimeout); prefs.putBool("car",carMode); prefs.putBool("night",nightMode);
   prefs.end();
 }
+static void otaMenu() {
+  if(WiFi.status()!=WL_CONNECTED || M5.Power.getVBUSVoltage()<4400) {
+    heading("OTA needs WiFi + USB"); delay(2000); return;
+  }
+  if(!esp_ota_get_next_update_partition(nullptr)) { heading("No OTA partition"); delay(2000); return; }
+  bool wasPlaying=playing; playing=false; ++generation; clearAudio();
+  char pass[17]; snprintf(pass,sizeof(pass),"%08lx%08lx",(unsigned long)esp_random(),(unsigned long)esp_random());
+  WebServer ota(8080);
+  bool authorized=false, started=false, good=false, restart=false;
+  size_t received=0;
+  ota.on("/",HTTP_GET,[&]() {
+    if(!ota.authenticate("awc",pass)) { ota.requestAuthentication(); return; }
+    ota.send(200,"text/html","<!doctype html><meta name='viewport' content='width=device-width'><h2>AWC Radio firmware update</h2><p>Keep USB connected. Select firmware.bin only, not the merged full image.</p><form method='POST' action='/update' enctype='multipart/form-data'><input type='file' name='firmware' accept='.bin' required><button>Update</button></form>");
+  });
+  ota.on("/update",HTTP_POST,[&]() {
+    if(!ota.authenticate("awc",pass)) { ota.requestAuthentication(); return; }
+    ota.send(good?200:400,"text/plain",good?"Update successful. Restarting.":"Update failed. Existing firmware retained.");
+    restart=good;
+  },[&]() {
+    HTTPUpload &u=ota.upload();
+    if(u.status==UPLOAD_FILE_START) {
+      authorized=ota.authenticate("awc",pass);
+      good=false; received=0;
+      started=authorized && u.filename=="firmware.bin" && M5.Power.getVBUSVoltage()>=4400 && Update.begin(UPDATE_SIZE_UNKNOWN,U_FLASH);
+    } else if(u.status==UPLOAD_FILE_WRITE && started) {
+      if(M5.Power.getVBUSVoltage()<4000 || Update.write(u.buf,u.currentSize)!=u.currentSize) { Update.abort(); started=false; }
+      else received+=u.currentSize;
+    } else if(u.status==UPLOAD_FILE_END && started) {
+      good=received>0 && Update.end(true); if(!good) Update.abort(); started=false;
+    } else if(u.status==UPLOAD_FILE_ABORTED && started) { Update.abort(); started=false; }
+  });
+  ota.begin();
+  heading("Firmware update");
+  M5.Display.setTextSize(1); M5.Display.setCursor(8,45);
+  M5.Display.println("Open in browser (same WiFi):");
+  M5.Display.printf("http://%s:8080\n",WiFi.localIP().toString().c_str());
+  M5.Display.printf("User: awc\nPassword: %s\n",pass);
+  M5.Display.println("Upload firmware.bin only.");
+  M5.Display.println("Keep USB power connected.");
+  keyBox(4,190,312,45,"CANCEL");
+  unsigned long began=millis();
+  while(millis()-began<600000 || started) {
+    ota.handleClient(); M5.update();
+    if(restart) { delay(700); ESP.restart(); }
+    if(!started && (WiFi.status()!=WL_CONNECTED || M5.Power.getVBUSVoltage()<4000)) break;
+    if(!started && M5.Touch.getCount()) { auto t=M5.Touch.getDetail(0); if(t.wasPressed() && t.y>=190) break; }
+    delay(10);
+  }
+  if(started) Update.abort();
+  ota.stop(); playing=wasPlaying; ++generation; clearAudio(); lastTouch=millis();
+}
+static void diagnosticsMenu() {
+  heading("Diagnostics v0.5");
+  M5.Display.setTextSize(1); M5.Display.setCursor(8,38);
+  M5.Display.printf("IP: %s\nRSSI: %d dBm\nHeap: %u bytes\nPSRAM: %u bytes\nUptime: %lu s\nUSB: %d mV\nBattery: %d%%\n",WiFi.localIP().toString().c_str(),WiFi.RSSI(),ESP.getFreeHeap(),ESP.getFreePsram(),millis()/1000,M5.Power.getVBUSVoltage(),M5.Power.getBatteryLevel());
+  keyBox(4,190,312,45,"BACK"); int x,y; do {tap(x,y);} while(y<190);
+}
+static void systemMenu() {
+  while(true) {
+    heading("System settings");
+    keyBox(4,45,312,42,"WiFi / Bluetooth / Server setup");
+    keyBox(4,90,312,42,"OTA firmware update");
+    keyBox(4,135,312,42,"Diagnostics");
+    keyBox(4,190,312,45,"BACK");
+    int x,y; tap(x,y);
+    if(y>=190) return;
+    if(y>=45 && y<87) { prefs.begin("awc-radio",false); prefs.putBool("setup",true); prefs.end(); ESP.restart(); }
+    if(y>=90 && y<132) otaMenu();
+    if(y>=135 && y<177) diagnosticsMenu();
+  }
+}
 static void powerMenu() {
   while(true) {
     heading("Power settings");
@@ -768,7 +842,7 @@ void loop() {
       lastTouch=millis();
       if(screenOff) { screenOff=false; applyBrightness(); drawScreen(); return; }
       if(detail.y<30) {
-        if(detail.x>=288 || detail.x<42) { prefs.begin("awc-radio",false); prefs.putBool("setup",true); prefs.end(); ESP.restart(); }
+        if(detail.x>=288 || detail.x<42) systemMenu();
         else if(detail.x>=215) powerMenu();
         else if(detail.x>=145 && detail.x<175) liveBluetooth();
       } else if(detail.y>=170 && detail.y<216) {
