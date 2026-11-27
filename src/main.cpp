@@ -9,8 +9,20 @@
 // Local credentials override the public example (which never contains secrets).
 #if __has_include("../include/config.h")
 #include "../include/config.h"
-#else
-#include "../include/config.example.h"
+#endif
+
+// Safe defaults for public CI, independent of header search behavior.
+#ifndef WIFI_SSID
+#define WIFI_SSID "YOUR_IPHONE_HOTSPOT"
+#endif
+#ifndef WIFI_PASSWORD
+#define WIFI_PASSWORD "YOUR_HOTSPOT_PASSWORD"
+#endif
+#ifndef BT_SPEAKER_NAME
+#define BT_SPEAKER_NAME "YOUR_CAR_BLUETOOTH_NAME"
+#endif
+#ifndef RADIO_SERVER_URL
+#define RADIO_SERVER_URL "http://192.168.8.8:8088"
 #endif
 
 using audio_tools::URLStream;
