@@ -36,7 +36,8 @@ jobs:
           Flash AWC-Radio-Core2-Full.bin at 0x0000 using ESP32, DIO, 40 MHz, 16 MB.
           This replaces the bootloader, partition table and application.
           Back up existing firmware/data before flashing.
-          Application-only update: firmware.bin at 0x10000, only with matching partitions.
+          OTA: upload firmware.bin using System settings > OTA firmware update on trusted LAN.
+          Application-only serial update: firmware.bin at 0x10000, only with matching partitions.
           Windows: install Python 3, then run Flash-Windows.bat.
           EOF
           cat > dist/Flash-Windows.bat <<'EOF'
@@ -58,9 +59,33 @@ jobs:
           pause
           exit /b 1
           EOF
+          printf 'Version: v0.6-preview\nCommit: %s\nBuild: %s\n' "$GITHUB_SHA" "$GITHUB_RUN_ID" > dist/VERSION.txt
+          cat > dist/CHANGELOG.txt <<'EOF'
+          v0.6 hardware-test preview
+          Touchscreen setup, Wi-Fi profiles, Bluetooth discovery and saved receivers.
+          Station artwork, favorites, metadata, volume, battery and car mode.
+          Local-first HTTP with optional authenticated HTTPS fallback.
+          OTA, diagnostics, watchdog, audio buffer and LCD optimizations.
+          Bluetooth disconnect suspends streaming; reconnect resumes playback.
+          Hardware validation pending; not a stable production release.
+          EOF
+          cat > dist/FIRST-BOOT.txt <<'EOF'
+          1. Back up existing Core2 firmware and data.
+          2. Connect USB data cable; run Flash-Windows.bat or flash merged binary at 0x0.
+          3. Configure home Wi-Fi, scan a Bluetooth speaker in pairing mode, select it.
+          4. Keep local server http://192.168.8.8:8088; leave remote blank initially.
+          5. Save and restart; verify station list, artwork and audio.
+          6. Test pause, volume, favorites, station switching and receiver reconnect.
+          7. Check diagnostics before and after 60 minutes of playback.
+          8. Configure optional HTTPS remote URL and credentials; test hotspot failover.
+          9. Test car mode USB removal and restoration while parked.
+          10. Test OTA only on trusted LAN with stable USB power.
+          Record any errors, serial logs and diagnostic readings.
+          EOF
+          (cd dist && sha256sum *.bin > SHA256SUMS.txt)
       - uses: actions/upload-artifact@v4
         with:
-          name: AWC-Radio-Core2-v0.1
+          name: AWC-Radio-Core2-v0.6-preview
           path: dist/
           if-no-files-found: error
           retention-days: 30
