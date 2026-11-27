@@ -4,7 +4,6 @@
 #include <ArduinoJson.h>
 #include <M5Unified.h>
 #include <BluetoothA2DPSource.h>
-#include "AudioTools/Communication/AudioHttp.h"
 #include "MP3DecoderHelix.h"
 // Local credentials override the public example (which never contains secrets).
 #if __has_include("../include/config.h")
@@ -25,7 +24,6 @@
 #define RADIO_SERVER_URL "http://192.168.8.8:8088"
 #endif
 
-using audio_tools::URLStream;
 using libhelix::MP3DecoderHelix;
 
 static BluetoothA2DPSource bluetooth;
@@ -113,27 +111,30 @@ static void networkTask(void *) {
     const uint32_t session = generation;
     const String path = "/api/stations/" + encoded(stationNames[stationIndex]) + "/stream";
     const String address = endpoint(path);
-    URLStream source;
-    source.setTimeout(8000);
+    WiFiClient client;
+    HTTPClient http;
+    http.useHTTP10(true); // close-delimited body, no HTTP/1.1 chunk framing
+    http.setTimeout(8000);
     MP3DecoderHelix decoder(decoded);
     clearAudio();
-    if (source.begin(address.c_str(), "audio/mpeg")) {
+    if (http.begin(client, address) && http.GET() == HTTP_CODE_OK) {
       streamOK = true;
       decoder.begin();
+      lastAudioMillis = millis();
       while (playing && generation == session && WiFi.status() == WL_CONNECTED) {
-        int available = source.available();
+        int available = client.available();
         if (available > 0) {
-          size_t got = source.readBytes(chunk, min((int)sizeof(chunk), available));
-          if (got) { decoder.write(chunk, got); lastAudioMillis = millis(); }
-        } else if (!source) {
+          int got = client.read(chunk, min((int)sizeof(chunk), available));
+          if (got > 0) { decoder.write(chunk, got); lastAudioMillis = millis(); }
+        } else if (!client.connected() || millis() - lastAudioMillis > 8000) {
           break;
         } else {
           vTaskDelay(pdMS_TO_TICKS(15));
         }
       }
       decoder.end();
-      source.end();
     }
+    http.end();
     streamOK = false;
     if (playing && generation == session) vTaskDelay(pdMS_TO_TICKS(1500));
   }
@@ -141,6 +142,7 @@ static void networkTask(void *) {
 
 static bool readJson(const String &path, JsonDocument &doc) {
   HTTPClient http;
+  http.useHTTP10(true);
   http.setTimeout(5000);
   if (!http.begin(endpoint(path))) return false;
   const int status = http.GET();
