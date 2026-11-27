@@ -7,6 +7,7 @@
 #include <SPIFFS.h>
 #include <esp_ota_ops.h>
 #include <esp_system.h>
+#include <esp_task_wdt.h>
 #include <ArduinoJson.h>
 #include <M5Unified.h>
 #include <BluetoothA2DPSource.h>
@@ -412,6 +413,10 @@ static size_t ringRead = 0, ringWrite = 0, ringCount = 0;
 static volatile bool playing = false;
 static volatile uint32_t generation = 1;
 static volatile uint32_t lastAudioMillis = 0;
+static volatile uint32_t streamHeartbeat=0;
+static volatile uint32_t streamRecoveries=0;
+static volatile bool streamWatchdogReady=false;
+static unsigned long lastRecovery=0;
 static String stationNames[40];
 static int stationCount = 0, stationIndex = 0;
 static String title = "", artist = "", nextTitle="", lastStation="";
@@ -496,7 +501,9 @@ static void decoded(MP3FrameInfo &info, short *samples, size_t count, void *) {
 
 static void networkTask(void *) {
   uint8_t chunk[2048];
+  streamWatchdogReady=(esp_task_wdt_add(nullptr)==ESP_OK);
   while (true) {
+    streamHeartbeat=millis(); if(streamWatchdogReady) esp_task_wdt_reset();
     if (liveSwitching || !btEnabled || !playing || stationCount == 0 || WiFi.status() != WL_CONNECTED) {
       vTaskDelay(pdMS_TO_TICKS(300));
       continue;
@@ -507,6 +514,7 @@ static void networkTask(void *) {
     WiFiClient client;
     HTTPClient http;
     http.useHTTP10(true); // close-delimited body, no HTTP/1.1 chunk framing
+    http.setConnectTimeout(5000);
     http.setTimeout(8000);
     MP3DecoderHelix decoder(decoded);
     clearAudio();
@@ -515,6 +523,7 @@ static void networkTask(void *) {
       decoder.begin();
       lastAudioMillis = millis();
       while (playing && generation == session && WiFi.status() == WL_CONNECTED) {
+        streamHeartbeat=millis(); if(streamWatchdogReady) esp_task_wdt_reset();
         int available = client.available();
         if (available > 0) {
           int got = client.read(chunk, min((int)sizeof(chunk), available));
@@ -529,6 +538,7 @@ static void networkTask(void *) {
     }
     http.end();
     streamOK = false;
+    streamHeartbeat=millis(); if(streamWatchdogReady) esp_task_wdt_reset();
     if (playing && generation == session) vTaskDelay(pdMS_TO_TICKS(1500));
   }
 }
@@ -787,6 +797,7 @@ static void diagnosticsMenu() {
   heading("Diagnostics v0.5");
   M5.Display.setTextSize(1); M5.Display.setCursor(8,38);
   M5.Display.printf("IP: %s\nRSSI: %d dBm\nHeap: %u bytes\nPSRAM: %u bytes\nUptime: %lu s\nUSB: %d mV\nBattery: %d%%\n",WiFi.localIP().toString().c_str(),WiFi.RSSI(),ESP.getFreeHeap(),ESP.getFreePsram(),millis()/1000,M5.Power.getVBUSVoltage(),M5.Power.getBatteryLevel());
+  M5.Display.printf("Stream resets: %lu\nWatchdog: %s\n",(unsigned long)streamRecoveries,streamWatchdogReady?"ON":"OFF");
   keyBox(4,190,312,45,"BACK"); int x,y; do {tap(x,y);} while(y<190);
 }
 static void systemMenu() {
@@ -932,6 +943,8 @@ void setup() {
     btStartedForAudio=true;
   }
   playing = stationCount > 0;
+  // Arduino ESP32 2.x (PlatformIO espressif32 6.12): task watchdog API.
+  esp_task_wdt_init(30,true);
   xTaskCreatePinnedToCore(networkTask, "AWCStream", 12000, nullptr, 1, nullptr, 1);
   drawScreen();
 }
@@ -940,6 +953,12 @@ void loop() {
   M5.update();
   powerTick();
   if(standby) { delay(100); return; }
+  unsigned long now=millis();
+  if(playing && btEnabled && !liveSwitching && WiFi.status()==WL_CONNECTED && stationCount && streamOK && now-lastAudioMillis>12000 && now-lastRecovery>15000) {
+    lastRecovery=now; ++streamRecoveries; ++generation; clearAudio();
+    Serial.println("Recovery: restarting stalled stream");
+  }
+  if(streamHeartbeat && now-streamHeartbeat>45000) { Serial.println("Recovery: stream task unresponsive"); ESP.restart(); }
   if(btEnabled && btStartedForAudio && selectedBT>=0 && hasAddr(savedBT[selectedBT].addr) && !bluetooth.is_connected() && !bluetooth.is_discovery_active() && millis()-lastBTAttempt>15000) {
     lastBTAttempt=millis(); bluetooth.connect_to(savedBT[selectedBT].addr);
   }
