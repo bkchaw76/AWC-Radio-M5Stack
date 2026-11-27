@@ -990,12 +990,25 @@ static void powerTick() {
   if(!standby && !screenOff && screenTimeout && now-lastTouch>=1000UL*screenTimeout) { screenOff=true; applyBrightness(); }
 }
 static String clockText(int seconds) { char b[24]; snprintf(b,sizeof(b),"%d:%02d",seconds/60,seconds%60); return String(b); }
-static void drawScreen() {
+static uint64_t lastScreenSignature=0;
+static void drawScreen(bool force=true) {
   auto &d=M5.Display;
   static M5Canvas screen(&M5.Display);
   if(!screen.width()) { screen.setColorDepth(16); screen.createSprite(320,240); }
   if(!screen.width()) return;
+  if(screenOff || standby) return;
   fetchLogo();
+  uint64_t sig=14695981039346656037ULL;
+  auto mix=[&](uint64_t v){sig^=v; sig*=1099511628211ULL;};
+  auto mixText=[&](const String &v){for(size_t i=0;i<v.length();i++) mix((uint8_t)v[i]); mix(256);};
+  mix(WiFi.status()); mix(btStartedForAudio && bluetooth.is_connected()); mix(streamOK); mix(playing); mix(M5.Power.getBatteryLevel()); mix(M5.Power.isCharging()); mix(stationCount); mix(stationIndex); mix(logoOK); mix(audioVolume); mix(audioMuted); mix(favorites);
+  mixText(title); mixText(artist); mixText(nextTitle);
+  if(stationCount) mixText(stationNames[stationIndex]);
+  mix((uint64_t)trackStart); mix((uint64_t)trackEnd);
+  if(trackEnd>trackStart) mix((millis()-metadataAt)/1000);
+  if(title.length()>17) mix((millis()/350)%(title.length()+4));
+  if(!force && sig==lastScreenSignature) return;
+  lastScreenSignature=sig;
   auto &c=screen;
   c.fillSprite(UI_BG);
   c.setTextColor(WiFi.status()==WL_CONNECTED?UI_GREEN:UI_GREY,UI_BG); c.setTextSize(1); c.setCursor(8,9); c.print("WiFi");
@@ -1013,9 +1026,10 @@ static void drawScreen() {
   else { c.fillRoundRect(8,38,94,94,8,0x2104); c.setTextColor(UI_GOLD); c.setCursor(25,78); c.print("RADIO"); }
   c.setTextSize(1); c.setTextColor(UI_GREY,UI_BG); c.setCursor(110,43); c.print(stationCount?stationNames[stationIndex].substring(0,33):"Loading stations");
   c.setTextSize(2); c.setTextColor(TFT_WHITE,UI_BG); c.setCursor(110,64);
-  String t=title.length()?title:"Waiting...";
-  if(t.length()>17) { int offset=(millis()/350)%(t.length()+4); t=(t+"    "+t).substring(offset,offset+17); }
-  c.print(t.substring(0,17));
+  const String &t=title;
+  if(!t.length()) c.print("Waiting...");
+  else if(t.length()<=17) c.print(t);
+  else { size_t offset=(millis()/350)%(t.length()+4); for(size_t i=0;i<17;i++) { size_t j=(offset+i)%(t.length()+4); c.write(j<t.length()?(uint8_t)t[j]:(uint8_t)' '); } }
   c.setTextSize(1); c.setTextColor(UI_GREY,UI_BG); c.setCursor(110,98); c.print(artist.substring(0,33));
   c.setTextColor(UI_GOLD,UI_BG); c.setCursor(110,119); c.printf(audioMuted?"MUTED  (tap)":"VOL %d%%  (tap)",(int)audioVolume);
   int duration=max(0,(int)(trackEnd-trackStart));
@@ -1137,7 +1151,7 @@ void loop() {
   }
   if (!screenOff && millis() - lastScreen > 500) {
     lastScreen = millis();
-    drawScreen();
+    drawScreen(false);
   }
   delay(25);
 }
