@@ -1,0 +1,5 @@
+.pio/
+.vscode/
+include/config.h
+*.log
+.DS_Store
