@@ -145,7 +145,32 @@ static void gapScan(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *p) {
   }
   portEXIT_CRITICAL(&scanMux);
 }
+struct SavedBT { char name[249]; uint8_t addr[6]; };
+static SavedBT savedBT[8]={};
+static int savedCount=0, selectedBT=-1;
+static uint8_t chosenAddr[6]={};
+static bool btEnabled=true;
+static bool hasAddr(const uint8_t *a) { for(int i=0;i<6;i++) if(a[i]) return true; return false; }
+static void loadBT() {
+  if(prefs.getBytesLength("btlist")==sizeof(savedBT)) prefs.getBytes("btlist",savedBT,sizeof(savedBT));
+  savedCount=constrain(prefs.getInt("btcount",0),0,8);
+  selectedBT=prefs.getInt("btindex",-1);
+  if(selectedBT<0 || selectedBT>=savedCount) selectedBT=-1;
+  btEnabled=prefs.getBool("btenabled",true);
+}
+static void saveBT() {
+  prefs.putBytes("btlist",savedBT,sizeof(savedBT));
+  prefs.putInt("btcount",savedCount); prefs.putInt("btindex",selectedBT);
+  prefs.putBool("btenabled",btEnabled);
+}
+static bool initClassic() {
+  if(!btStarted() && !btStart()) return false;
+  if(esp_bluedroid_get_status()==ESP_BLUEDROID_STATUS_UNINITIALIZED && esp_bluedroid_init()!=ESP_OK) return false;
+  if(esp_bluedroid_get_status()==ESP_BLUEDROID_STATUS_INITIALIZED && esp_bluedroid_enable()!=ESP_OK) return false;
+  return true;
+}
 static String chooseBluetooth() {
+  memset(chosenAddr,0,6);
   if(!btStarted() && !btStart()) return keyboard("Bluetooth name",btName);
   if(esp_bluedroid_get_status()==ESP_BLUEDROID_STATUS_UNINITIALIZED && esp_bluedroid_init()!=ESP_OK) return keyboard("Bluetooth name",btName);
   if(esp_bluedroid_get_status()==ESP_BLUEDROID_STATUS_INITIALIZED && esp_bluedroid_enable()!=ESP_OK) return keyboard("Bluetooth name",btName);
@@ -178,14 +203,62 @@ static String chooseBluetooth() {
         else if(x<120) { if(page+4<n) page+=4; }
         else if(x<190) break;
         else if(x<260) return keyboard("Bluetooth name",btName=="YOUR_CAR_BLUETOOTH_NAME"?"":btName);
-        else return btName;
+        else return "";
       } else if(y>=35 && y<195 && page+(y-35)/40<n) {
         FoundBT item;
         portENTER_CRITICAL(&scanMux); item=foundBT[page+(y-35)/40]; portEXIT_CRITICAL(&scanMux);
+        memcpy(chosenAddr,item.addr,6);
         return String(item.name);
       }
     }
   }
+}
+static void manageBluetooth() {
+  int page=0;
+  while(true) {
+    heading("Bluetooth manager");
+    for(int i=0;i<4 && page+i<savedCount;i++) {
+      int idx=page+i;
+      keyBox(4,35+i*40,244,40,String(idx==selectedBT && btEnabled?"* ":"")+String(savedBT[idx].name).substring(0,32));
+      keyBox(248,35+i*40,72,40,"FORGET");
+    }
+    keyBox(0,200,48,40,"PREV"); keyBox(48,200,48,40,"NEXT"); keyBox(96,200,64,40,"ADD"); keyBox(160,200,96,40,btEnabled?"DISCONNECT":"ENABLE"); keyBox(256,200,64,40,"BACK");
+    int x,y; tap(x,y);
+    if(y>=200) {
+      if(x<48) page=max(0,page-4);
+      else if(x<96) { if(page+4<savedCount) page+=4; }
+      else if(x<160) {
+        String name=chooseBluetooth();
+        if(!name.length()) continue;
+        int idx=0;
+        while(idx<savedCount && !(hasAddr(chosenAddr)?memcmp(savedBT[idx].addr,chosenAddr,6)==0:!hasAddr(savedBT[idx].addr)&&name==savedBT[idx].name)) idx++;
+        if(idx==8) { heading("List full: forget one"); delay(1500); continue; }
+        if(idx==savedCount) savedCount++;
+        memset(&savedBT[idx],0,sizeof(SavedBT));
+        name.toCharArray(savedBT[idx].name,sizeof(savedBT[idx].name)); memcpy(savedBT[idx].addr,chosenAddr,6);
+        selectedBT=idx; btName=name; btEnabled=true; page=(idx/4)*4;
+      } else if(x<256) btEnabled=!btEnabled;
+      else return;
+    } else if(y>=35 && y<195 && page+(y-35)/40<savedCount) {
+      int idx=page+(y-35)/40;
+      if(x>=248) {
+        heading("Forget device?"); keyBox(0,100,160,60,"CANCEL"); keyBox(160,100,160,60,"FORGET");
+        int cx,cy; tap(cx,cy); if(cx<160 || cy<100 || cy>=160) continue;
+        if(hasAddr(savedBT[idx].addr) && initClassic()) esp_bt_gap_remove_bond_device(savedBT[idx].addr);
+        for(int k=idx;k+1<savedCount;k++) savedBT[k]=savedBT[k+1];
+        memset(&savedBT[--savedCount],0,sizeof(SavedBT));
+        if(selectedBT==idx) { selectedBT=-1; btEnabled=false; btName=""; }
+        else if(selectedBT>idx) selectedBT--;
+        page=min(page,max(0,((savedCount-1)/4)*4));
+      } else { selectedBT=idx; btName=savedBT[idx].name; btEnabled=true; }
+    }
+    saveBT(); prefs.putString("bt",btName);
+  }
+}
+static bool matchSaved(const char *name,esp_bd_addr_t addr,int rssi) {
+  (void)rssi;
+  if(selectedBT>=0 && hasAddr(savedBT[selectedBT].addr)) return memcmp(addr,savedBT[selectedBT].addr,6)==0;
+  return btName==name;
 }
 static bool lcdSetup() {
   while(true) {
@@ -197,10 +270,10 @@ static bool lcdSetup() {
     keyBox(4,195,312,42,"Phone setup (optional)");
     int x,y; tap(x,y);
     if(y>=35 && y<75) { wifiName=chooseWifi(); wifiPassword=keyboard("Wi-Fi password","",true); }
-    else if(y>=75 && y<115) btName=chooseBluetooth();
+    else if(y>=75 && y<115) manageBluetooth();
     else if(y>=115 && y<155) radioURL=keyboard("Radio server URL",radioURL);
     else if(y>=155 && y<195) {
-      if(!wifiName.length() || wifiName=="YOUR_IPHONE_HOTSPOT" || !btName.length() || btName=="YOUR_CAR_BLUETOOTH_NAME" || !radioURL.startsWith("http://")) { heading("Check settings"); delay(1200); continue; }
+      if(!wifiName.length() || wifiName=="YOUR_IPHONE_HOTSPOT" || (btEnabled && (!btName.length() || btName=="YOUR_CAR_BLUETOOTH_NAME")) || !radioURL.startsWith("http://")) { heading("Check settings"); delay(1200); continue; }
       prefs.putString("ssid",wifiName); prefs.putString("password",wifiPassword); prefs.putString("bt",btName); prefs.putString("url",radioURL);
       prefs.end(); ESP.restart(); return true;
     } else if(y>=195) return false;
@@ -211,12 +284,13 @@ static void configureDevice() {
   wifiName = prefs.getString("ssid", WIFI_SSID);
   wifiPassword = prefs.getString("password", WIFI_PASSWORD);
   btName = prefs.getString("bt", BT_SPEAKER_NAME);
+  loadBT();
   radioURL = prefs.getString("url", RADIO_SERVER_URL);
   bool forceSetup=prefs.getBool("setup",false); prefs.remove("setup");
   // Hold the touchscreen during startup to reopen setup.
   delay(600);
   M5.update();
-  if (wifiName != "YOUR_IPHONE_HOTSPOT" && btName != "YOUR_CAR_BLUETOOTH_NAME" && !M5.Touch.getCount() && !forceSetup) {
+  if (wifiName != "YOUR_IPHONE_HOTSPOT" && (!btEnabled || btName != "YOUR_CAR_BLUETOOTH_NAME") && !M5.Touch.getCount() && !forceSetup) {
     prefs.end();
     return;
   }
@@ -245,6 +319,7 @@ static void configureDevice() {
     prefs.putString("ssid", setupServer.arg("ssid"));
     prefs.putString("password", setupServer.arg("password"));
     prefs.putString("bt", setupServer.arg("bt"));
+    selectedBT=-1; btEnabled=true; saveBT();
     prefs.putString("url", url);
     setupServer.send(200, "text/plain", "Saved. Restarting...");
     delay(500);
@@ -315,7 +390,9 @@ static void decoded(MP3FrameInfo &info, short *samples, size_t count, void *) {
       info.nChans != 2) return;
   // Helix callback length is count of 16-bit PCM samples, not stereo frames.
   size_t frames = count / 2;
-  for (size_t pos = 0; pos < frames && playing;) {
+  const uint32_t session=generation;
+  const unsigned long started=millis();
+  for (size_t pos = 0; pos < frames && playing && generation==session && millis()-started<1000;) {
     if (xSemaphoreTake(audioMutex, pdMS_TO_TICKS(40)) != pdTRUE) continue;
     size_t space = RING_FRAMES - ringCount;
     size_t take = min(space, frames - pos);
@@ -334,7 +411,7 @@ static void decoded(MP3FrameInfo &info, short *samples, size_t count, void *) {
 static void networkTask(void *) {
   uint8_t chunk[2048];
   while (true) {
-    if (!playing || stationCount == 0 || WiFi.status() != WL_CONNECTED) {
+    if (!btEnabled || !playing || stationCount == 0 || WiFi.status() != WL_CONNECTED) {
       vTaskDelay(pdMS_TO_TICKS(300));
       continue;
     }
@@ -469,8 +546,12 @@ void setup() {
   if (WiFi.status() == WL_CONNECTED) refreshStations();
 
   bluetooth.set_data_callback_in_frames(bluetoothFrames);
-  bluetooth.set_auto_reconnect(true);
-  bluetooth.start(btName.c_str());
+  if(btEnabled) {
+    bluetooth.set_ssid_callback(matchSaved);
+    if(selectedBT>=0 && hasAddr(savedBT[selectedBT].addr)) bluetooth.set_auto_reconnect(savedBT[selectedBT].addr);
+    else bluetooth.set_auto_reconnect(false);
+    bluetooth.start(btName.c_str());
+  }
   playing = stationCount > 0;
   xTaskCreatePinnedToCore(networkTask, "AWCStream", 12000, nullptr, 1, nullptr, 1);
   drawScreen();
