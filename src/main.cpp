@@ -38,6 +38,9 @@
 
 using libhelix::MP3DecoderHelix;
 static String wifiName, wifiPassword, btName, radioURL, radioUser, radioPass;
+static String localURL, remoteURL;
+static bool usingRemote=false;
+static SemaphoreHandle_t serverMutex=nullptr;
 static const char ROOT_CA[] = R"PEM(-----BEGIN CERTIFICATE-----
 MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw
 TzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2Vh
@@ -77,7 +80,7 @@ static bool beginRadio(HTTPClient &http, WiFiClient &plain, WiFiClientSecure &tl
     if(time(nullptr)<1700000000) return false;
     tls.setCACert(ROOT_CA); tls.setHandshakeTimeout(8);
     if(!http.begin(tls,url)) return false;
-    if(radioUser.length()) http.setAuthorization(radioUser.c_str(),radioPass.c_str());
+    if(radioUser.length() && remoteURL.length() && url.startsWith(remoteURL+"/")) http.setAuthorization(radioUser.c_str(),radioPass.c_str());
   } else { if(!http.begin(plain,url)) return false; }
   http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
   return true;
@@ -383,16 +386,16 @@ static bool lcdSetup() {
     heading("AWC Radio Settings");
     keyBox(4,35,312,38,"Wi-Fi: "+wifiName);
     keyBox(4,75,312,38,"Bluetooth: "+btName);
-    keyBox(4,115,312,38,"Server: "+radioURL);
+    keyBox(4,115,312,38,"Servers: "+localURL);
     keyBox(4,155,312,38,"Save and restart");
     keyBox(4,195,312,42,"Phone setup (optional)");
     int x,y; tap(x,y);
     if(y>=35 && y<75) wifiManager();
     else if(y>=75 && y<115) manageBluetooth();
-    else if(y>=115 && y<155) { radioURL=keyboard("Radio server URL",radioURL); if(radioURL.startsWith("https://")) { radioUser=keyboard("HTTPS user (optional)",radioUser); radioPass=keyboard("HTTPS password",radioPass,true); } }
+    else if(y>=115 && y<155) { localURL=keyboard("Local server URL",localURL); remoteURL=keyboard("Remote HTTPS (optional)",remoteURL); if(remoteURL.length()) { radioUser=keyboard("HTTPS user (optional)",radioUser); radioPass=keyboard("HTTPS password",radioPass,true); } }
     else if(y>=155 && y<195) {
-      if(!wifiName.length() || wifiName=="YOUR_IPHONE_HOTSPOT" || (btEnabled && (!btName.length() || btName=="YOUR_CAR_BLUETOOTH_NAME")) || !validURL(radioURL)) { heading("Check settings"); delay(1200); continue; }
-      prefs.putString("ssid",wifiName); prefs.putString("password",wifiPassword); prefs.putString("bt",btName); prefs.putString("url",radioURL); prefs.putString("ruser",radioUser); prefs.putString("rpass",radioPass);
+      if(!wifiName.length() || wifiName=="YOUR_IPHONE_HOTSPOT" || (btEnabled && (!btName.length() || btName=="YOUR_CAR_BLUETOOTH_NAME")) || !validURL(localURL) || (remoteURL.length() && (!validURL(remoteURL) || !remoteURL.startsWith("https://")))) { heading("Check settings"); delay(1200); continue; }
+      prefs.putString("ssid",wifiName); prefs.putString("password",wifiPassword); prefs.putString("bt",btName); prefs.putString("url",localURL); prefs.putString("remote",remoteURL); prefs.putString("ruser",radioUser); prefs.putString("rpass",radioPass);
       prefs.end(); ESP.restart(); return true;
     } else if(y>=195) return false;
   }
@@ -404,7 +407,12 @@ static void configureDevice() {
   loadWifi();
   btName = prefs.getString("bt", BT_SPEAKER_NAME);
   loadBT();
-  radioURL = prefs.getString("url", RADIO_SERVER_URL);
+  localURL = prefs.getString("url", RADIO_SERVER_URL);
+  remoteURL=prefs.getString("remote","");
+  if(localURL.startsWith("https://") && !remoteURL.length()) { remoteURL=localURL; localURL=RADIO_SERVER_URL; }
+  while(localURL.endsWith("/")) localURL.remove(localURL.length()-1);
+  while(remoteURL.endsWith("/")) remoteURL.remove(remoteURL.length()-1);
+  radioURL=localURL;
   radioUser=prefs.getString("ruser",""); radioPass=prefs.getString("rpass","");
   bool forceSetup=prefs.getBool("setup",false); prefs.remove("setup");
   // Hold the touchscreen during startup to reopen setup.
@@ -442,7 +450,7 @@ static void configureDevice() {
     wifiIndex=n; savedSSID[n]=setupServer.arg("ssid"); savedPass[n]=setupServer.arg("password"); saveWifi();
     prefs.putString("bt", setupServer.arg("bt"));
     selectedBT=-1; btEnabled=true; saveBT();
-    prefs.putString("url", url); prefs.remove("ruser"); prefs.remove("rpass");
+    prefs.putString("url", url);
     setupServer.send(200, "text/plain", "Saved. Restarting...");
     delay(500);
     prefs.end();
@@ -498,7 +506,9 @@ static String encoded(const String &s) {
 }
 
 static String endpoint(const String &path) {
+  if(serverMutex) xSemaphoreTake(serverMutex,portMAX_DELAY);
   String base = radioURL;
+  if(serverMutex) xSemaphoreGive(serverMutex);
   while (base.endsWith("/")) base.remove(base.length() - 1);
   return base + path;
 }
@@ -614,6 +624,37 @@ static bool readJson(const String &path, JsonDocument &doc) {
   return !err;
 }
 
+static bool probeServer(String base) {
+  while(base.endsWith("/")) base.remove(base.length()-1);
+  if(!validURL(base)) return false;
+  WiFiClient plain; WiFiClientSecure tls; HTTPClient http;
+  http.useHTTP10(true); http.setConnectTimeout(1500); http.setTimeout(2500);
+  if(!beginRadio(http,plain,tls,base+"/api/stations")) return false;
+  bool ok=false;
+  if(http.GET()==200) { JsonDocument doc; ok=!deserializeJson(doc,http.getStream()) && doc.is<JsonArray>() && doc.size()>0; }
+  http.end(); return ok;
+}
+static unsigned long lastServerCheck=0;
+static String checkedSSID;
+static IPAddress checkedIP;
+static bool serverReachable=false;
+static void checkServers(bool force=false) {
+  if(WiFi.status()!=WL_CONNECTED) { serverReachable=false; checkedSSID=""; return; }
+  String ssid=WiFi.SSID(); IPAddress ip=WiFi.localIP();
+  bool changed=ssid!=checkedSSID || ip!=checkedIP;
+  if(!force && !changed && millis()-lastServerCheck<(serverReachable?60000UL:10000UL)) return;
+  checkedSSID=ssid; checkedIP=ip; lastServerCheck=millis();
+  bool local=probeServer(localURL);
+  bool remote=!local && remoteURL.length() && probeServer(remoteURL);
+  serverReachable=local || remote;
+  if(!serverReachable) return;
+  String chosen=local?localURL:remoteURL;
+  if(chosen!=radioURL) {
+    xSemaphoreTake(serverMutex,portMAX_DELAY); radioURL=chosen; xSemaphoreGive(serverMutex);
+    usingRemote=remote; ++generation; clearAudio(); logoDirty=true; logoOK=false; logoRetryAt=0; lastMetadata=0;
+    Serial.println(remote?"Using remote HTTPS server":"Using local radio server");
+  }
+}
 static void refreshStations() {
   JsonDocument doc;
   if (!readJson("/api/stations", doc) || !doc.is<JsonArray>()) return;
@@ -712,7 +753,7 @@ static constexpr uint16_t UI_BG=0x0862, UI_GOLD=0xED6C, UI_GREY=0xAD55, UI_GREEN
 static bool cacheReady=false;
 static String logoPath() {
   uint64_t hash=14695981039346656037ULL;
-  String key=radioURL+"/"+stationNames[stationIndex];
+  String key=localURL+"/"+stationNames[stationIndex];
   for(size_t i=0;i<key.length();i++) { hash^=(uint8_t)key[i]; hash*=1099511628211ULL; }
   char name[32]; snprintf(name,sizeof(name),"/l%016llx.raw",(unsigned long long)hash);
   return String(name);
@@ -1000,9 +1041,10 @@ void setup() {
   applyBrightness(); lastTouch=millis();
 
 
+  serverMutex=xSemaphoreCreateMutex();
   audioMutex = xSemaphoreCreateMutex();
   pcmRing = (Frame *)ps_malloc(RING_FRAMES * sizeof(Frame));
-  if (!audioMutex || !pcmRing) {
+  if (!serverMutex || !audioMutex || !pcmRing) {
     Serial.println("FATAL: PSRAM/mutex allocation failed");
     M5.Display.println("PSRAM allocation failed");
     while (true) delay(1000);
@@ -1014,7 +1056,7 @@ void setup() {
   Serial.println("Connecting WiFi...");
   const unsigned long start = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) delay(250);
-  if (WiFi.status() == WL_CONNECTED) refreshStations();
+  if (WiFi.status() == WL_CONNECTED) { checkServers(true); refreshStations(); }
 
   bluetooth.set_data_callback_in_frames(bluetoothFrames);
   if(btEnabled) {
@@ -1044,6 +1086,7 @@ void loop() {
   if(btEnabled && btStartedForAudio && selectedBT>=0 && hasAddr(savedBT[selectedBT].addr) && !bluetooth.is_connected() && !bluetooth.is_discovery_active() && millis()-lastBTAttempt>15000) {
     lastBTAttempt=millis(); bluetooth.connect_to(savedBT[selectedBT].addr);
   }
+  checkServers();
   if (WiFi.status() != WL_CONNECTED) {
     static unsigned long lastWiFiRetry = 0;
     if (millis() - lastWiFiRetry > 15000 && millis()-wifiAttemptAt>=15000) {
