@@ -469,6 +469,9 @@ static SemaphoreHandle_t audioMutex;
 static Frame *pcmRing = nullptr;
 static constexpr size_t RING_FRAMES = 32768; // 128 KB PSRAM, ~0.74 s PCM
 static size_t ringRead = 0, ringWrite = 0, ringCount = 0;
+static volatile uint32_t underruns=0, droppedFrames=0;
+static volatile uint32_t decoderSession=0;
+static_assert(sizeof(Frame)==4,"Stereo PCM frame must be four bytes");
 static volatile bool playing = false;
 static volatile int audioVolume=100;
 static volatile bool audioMuted=false;
@@ -530,15 +533,18 @@ static int32_t bluetoothFrames(Frame *dst, int32_t requested) {
   if(prebuffer && ringCount<11025) { xSemaphoreGive(audioMutex); return requested; }
   prebuffer=false;
   const int gain=audioMuted?0:audioVolume;
-  for (int32_t i = 0; i < requested && ringCount; ++i) {
-    dst[i] = pcmRing[ringRead];
+  size_t take=min((size_t)requested,ringCount);
+  size_t first=min(take,RING_FRAMES-ringRead);
+  memcpy(dst,pcmRing+ringRead,first*sizeof(Frame));
+  if(take>first) memcpy(dst+first,pcmRing,(take-first)*sizeof(Frame));
+  ringRead=(ringRead+take)%RING_FRAMES; ringCount-=take;
+  if(take<(size_t)requested) { ++underruns; prebuffer=true; }
+  xSemaphoreGive(audioMutex);
+  if(gain==0) memset(dst,0,take*sizeof(Frame));
+  else if(gain!=100) for(size_t i=0;i<take;i++) {
     dst[i].channel1=(int32_t)dst[i].channel1*gain/100;
     dst[i].channel2=(int32_t)dst[i].channel2*gain/100;
-    ringRead = (ringRead + 1) % RING_FRAMES;
-    --ringCount;
   }
-  if(!ringCount) prebuffer=true;
-  xSemaphoreGive(audioMutex);
   return requested;
 }
 
@@ -547,22 +553,24 @@ static void decoded(MP3FrameInfo &info, short *samples, size_t count, void *) {
       info.nChans != 2) return;
   // Helix callback length is count of 16-bit PCM samples, not stereo frames.
   size_t frames = count / 2;
-  const uint32_t session=generation;
+  const uint32_t session=decoderSession;
   const unsigned long started=millis();
-  for (size_t pos = 0; pos < frames && playing && generation==session && millis()-started<1000;) {
+  size_t pos=0;
+  for (; pos < frames && playing && generation==session && millis()-started<1000;) {
     if (xSemaphoreTake(audioMutex, pdMS_TO_TICKS(40)) != pdTRUE) continue;
+    if(generation!=session || !playing) { xSemaphoreGive(audioMutex); break; }
     size_t space = RING_FRAMES - ringCount;
     size_t take = min(space, frames - pos);
-    for (size_t j = 0; j < take; ++j) {
-      pcmRing[ringWrite].channel1 = samples[(pos + j) * 2];
-      pcmRing[ringWrite].channel2 = samples[(pos + j) * 2 + 1];
-      ringWrite = (ringWrite + 1) % RING_FRAMES;
-    }
+    size_t first=min(take,RING_FRAMES-ringWrite);
+    memcpy(pcmRing+ringWrite,samples+pos*2,first*sizeof(Frame));
+    if(take>first) memcpy(pcmRing,samples+(pos+first)*2,(take-first)*sizeof(Frame));
+    ringWrite=(ringWrite+take)%RING_FRAMES;
     ringCount += take;
     xSemaphoreGive(audioMutex);
     pos += take;
     if (!take) vTaskDelay(pdMS_TO_TICKS(5));
   }
+  if(pos<frames && generation==session && playing) droppedFrames+=frames-pos;
 }
 
 static void networkTask(void *) {
@@ -587,6 +595,7 @@ static void networkTask(void *) {
     if (beginRadio(http,plain,tls,address) && http.GET() == HTTP_CODE_OK) {
       WiFiClient &client=http.getStream();
       streamOK = true;
+      decoderSession=session;
       decoder.begin();
       lastAudioMillis = millis();
       while (playing && generation == session && WiFi.status() == WL_CONNECTED) {
@@ -899,6 +908,7 @@ static void diagnosticsMenu() {
   M5.Display.setTextSize(1); M5.Display.setCursor(8,38);
   M5.Display.printf("IP: %s\nRSSI: %d dBm\nHeap: %u bytes\nPSRAM: %u bytes\nUptime: %lu s\nUSB: %d mV\nBattery: %d%%\n",WiFi.localIP().toString().c_str(),WiFi.RSSI(),ESP.getFreeHeap(),ESP.getFreePsram(),millis()/1000,M5.Power.getVBUSVoltage(),M5.Power.getBatteryLevel());
   M5.Display.printf("Stream resets: %lu\nWatchdog: %s\n",(unsigned long)streamRecoveries,streamWatchdogReady?"ON":"OFF");
+  M5.Display.printf("Underruns: %lu\nDropped frames: %lu\n",(unsigned long)underruns,(unsigned long)droppedFrames);
   keyBox(4,190,312,45,"BACK"); int x,y; do {tap(x,y);} while(y<190);
 }
 static void volumeMenu() {
