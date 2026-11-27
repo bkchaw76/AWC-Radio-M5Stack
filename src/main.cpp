@@ -1,3 +1,4 @@
+#include <esp_heap_caps.h>
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -473,6 +474,8 @@ static Frame *pcmRing = nullptr;
 static constexpr size_t RING_FRAMES = 32768; // 128 KB PSRAM, ~0.74 s PCM
 static size_t ringRead = 0, ringWrite = 0, ringCount = 0;
 static volatile uint32_t underruns=0, droppedFrames=0;
+static uint32_t artworkAllocFailures=0;
+static TaskHandle_t streamTaskHandle=nullptr;
 static volatile uint32_t decoderSession=0;
 static_assert(sizeof(Frame)==4,"Stereo PCM frame must be four bytes");
 static volatile bool playing = false;
@@ -806,6 +809,7 @@ static void fetchLogo() {
     int len=http.getSize();
     if(len>0 && len<=512*1024) {
       uint8_t *buf=(uint8_t*)ps_malloc(len);
+      if(!buf) ++artworkAllocFailures;
       if(buf) {
         size_t got=http.getStream().readBytes(buf,len);
         if(!logoCanvas.width()) { logoCanvas.setColorDepth(16); logoCanvas.createSprite(94,94); }
@@ -907,11 +911,15 @@ static void otaMenu() {
   ota.stop(); playing=wasPlaying; ++generation; clearAudio(); lastTouch=millis();
 }
 static void diagnosticsMenu() {
-  heading("Diagnostics v0.5");
+  heading("Diagnostics v0.6");
   M5.Display.setTextSize(1); M5.Display.setCursor(8,38);
   M5.Display.printf("IP: %s\nRSSI: %d dBm\nHeap: %u bytes\nPSRAM: %u bytes\nUptime: %lu s\nUSB: %d mV\nBattery: %d%%\n",WiFi.localIP().toString().c_str(),WiFi.RSSI(),ESP.getFreeHeap(),ESP.getFreePsram(),millis()/1000,M5.Power.getVBUSVoltage(),M5.Power.getBatteryLevel());
   M5.Display.printf("Stream resets: %lu\nWatchdog: %s\n",(unsigned long)streamRecoveries,streamWatchdogReady?"ON":"OFF");
   M5.Display.printf("Underruns: %lu\nDropped frames: %lu\n",(unsigned long)underruns,(unsigned long)droppedFrames);
+  M5.Display.printf("Min heap: %u / largest: %u\n",ESP.getMinFreeHeap(),heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT));
+  M5.Display.printf("PSRAM largest: %u\n",heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+  M5.Display.printf("Artwork alloc failures: %lu\n",(unsigned long)artworkAllocFailures);
+  M5.Display.printf("Stream stack watermark: %u\n",streamTaskHandle?(unsigned)uxTaskGetStackHighWaterMark(streamTaskHandle):0);
   keyBox(4,190,312,45,"BACK"); int x,y; do {tap(x,y);} while(y<190);
 }
 static void volumeMenu() {
@@ -1003,7 +1011,7 @@ static void drawScreen(bool force=true) {
   auto &d=M5.Display;
   static M5Canvas screen(&M5.Display);
   if(!screen.width()) { screen.setColorDepth(16); screen.createSprite(320,240); }
-  if(!screen.width()) return;
+  if(!screen.width()) { M5.Display.setCursor(8,35); M5.Display.print("LCD memory unavailable"); return; }
   if(screenOff || standby) return;
   fetchLogo();
   uint64_t sig=14695981039346656037ULL;
@@ -1078,8 +1086,10 @@ void setup() {
   pcmRing = (Frame *)ps_malloc(RING_FRAMES * sizeof(Frame));
   if (!serverMutex || !audioMutex || !pcmRing) {
     Serial.println("FATAL: PSRAM/mutex allocation failed");
-    M5.Display.println("PSRAM allocation failed");
-    while (true) delay(1000);
+    heading("Audio memory allocation failed");
+    keyBox(4,190,312,45,"RESTART");
+    int x,y; do {tap(x,y);} while(y<190);
+    ESP.restart();
   }
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
@@ -1101,7 +1111,14 @@ void setup() {
   playing = stationCount > 0;
   // Arduino ESP32 2.x (PlatformIO espressif32 6.12): task watchdog API.
   esp_task_wdt_init(30,true);
-  xTaskCreatePinnedToCore(networkTask, "AWCStream", 12000, nullptr, 1, nullptr, 1);
+  if(xTaskCreatePinnedToCore(networkTask, "AWCStream", 12000, nullptr, 1, &streamTaskHandle, 1)!=pdPASS) {
+    playing=false;
+    Serial.println("FATAL: stream task allocation failed");
+    heading("Stream task allocation failed");
+    keyBox(4,190,312,45,"RESTART");
+    int x,y; do {tap(x,y);} while(y<190);
+    ESP.restart();
+  }
   drawScreen();
 }
 
