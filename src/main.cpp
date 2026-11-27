@@ -348,7 +348,10 @@ static String title = "", artist = "", nextTitle="", lastStation="";
 static double trackStart=0, trackEnd=0, elapsedBase=0;
 static unsigned long metadataAt=0;
 static uint64_t favorites=0;
-static int brightness=110;
+static int brightness=110, nightBrightness=40, screenTimeout=60;
+static bool carMode=false, nightMode=false, standby=false, screenOff=false, resumePlaying=false, seenUSB=false;
+static unsigned long lastTouch=0, usbLostAt=0, lastPowerPoll=0;
+static volatile bool prebuffer=true;
 static bool logoDirty=true, logoOK=false;
 static M5Canvas logoCanvas(&M5.Display);
 static unsigned long lastMetadata = 0, lastScreen = 0;
@@ -374,7 +377,7 @@ static String endpoint(const String &path) {
 static void clearAudio() {
   if (!audioMutex) return;
   if (xSemaphoreTake(audioMutex, pdMS_TO_TICKS(100))) {
-    ringRead = ringWrite = ringCount = 0;
+    ringRead = ringWrite = ringCount = 0; prebuffer=true;
     xSemaphoreGive(audioMutex);
   }
 }
@@ -383,13 +386,16 @@ static void clearAudio() {
 static int32_t bluetoothFrames(Frame *dst, int32_t requested) {
   if (requested <= 0) return 0;
   memset(dst, 0, (size_t)requested * sizeof(Frame));
-  if (!playing || !pcmRing) return requested;
+  if (!playing || !pcmRing || liveSwitching) return requested;
   if (xSemaphoreTake(audioMutex, 0) != pdTRUE) return requested;
+  if(prebuffer && ringCount<11025) { xSemaphoreGive(audioMutex); return requested; }
+  prebuffer=false;
   for (int32_t i = 0; i < requested && ringCount; ++i) {
     dst[i] = pcmRing[ringRead];
     ringRead = (ringRead + 1) % RING_FRAMES;
     --ringCount;
   }
+  if(!ringCount) prebuffer=true;
   xSemaphoreGive(audioMutex);
   return requested;
 }
@@ -597,15 +603,56 @@ static void chooseStationMenu() {
     else if(y>=35 && y<195 && page+(y-35)/40<n) { selectStation(ids[page+(y-35)/40]-stationIndex); return; }
   }
 }
+static void applyBrightness() { M5.Display.setBrightness(screenOff || standby?0:(nightMode?nightBrightness:brightness)); }
+static void savePower() {
+  prefs.begin("awc-radio",false);
+  prefs.putInt("bright",brightness); prefs.putInt("nightbright",nightBrightness);
+  prefs.putInt("timeout",screenTimeout); prefs.putBool("car",carMode); prefs.putBool("night",nightMode);
+  prefs.end();
+}
 static void powerMenu() {
   while(true) {
     heading("Power settings");
-    M5.Display.setTextSize(2); M5.Display.setCursor(12,45); M5.Display.printf("Battery: %d%%",M5.Power.getBatteryLevel());
-    keyBox(4,90,150,50,"DIMMER"); keyBox(164,90,150,50,"BRIGHTER"); keyBox(4,190,312,45,"BACK");
+    M5.Display.setTextSize(1); M5.Display.setCursor(8,32);
+    M5.Display.printf("Battery %d%%  USB %d mV",M5.Power.getBatteryLevel(),M5.Power.getVBUSVoltage());
+    keyBox(4,48,312,32,String("Car mode: ")+(carMode?"ON":"OFF"));
+    keyBox(4,82,312,32,String("Display: ")+(nightMode?"NIGHT":"DAY"));
+    keyBox(4,116,150,32,"DIM -"); keyBox(164,116,150,32,"BRIGHT +");
+    keyBox(4,150,312,32,String("Screen timeout: ")+(screenTimeout?String(screenTimeout)+"s":"OFF"));
+    keyBox(4,190,312,45,"BACK");
     int x,y; tap(x,y);
-    if(y>=190) return;
-    if(y>=90 && y<140) { brightness=constrain(brightness+(x<160?-20:20),20,255); M5.Display.setBrightness(brightness); prefs.begin("awc-radio",false); prefs.putInt("bright",brightness); prefs.end(); }
+    if(y>=190) { lastTouch=millis(); return; }
+    if(y>=48 && y<80) { carMode=!carMode; seenUSB=false; usbLostAt=0; }
+    else if(y>=82 && y<114) nightMode=!nightMode;
+    else if(y>=116 && y<148) { int &level=nightMode?nightBrightness:brightness; level=constrain(level+(x<160?-15:15),15,255); }
+    else if(y>=150 && y<182) screenTimeout=screenTimeout==0?30:screenTimeout==30?60:screenTimeout==60?120:0;
+    applyBrightness(); savePower();
   }
+}
+static void powerTick() {
+  unsigned long now=millis();
+  if(now-lastPowerPoll<1000) return;
+  lastPowerPoll=now;
+  int mv=M5.Power.getVBUSVoltage();
+  if(carMode && mv>=0) {
+    if(mv>=4400) {
+      seenUSB=true; usbLostAt=0;
+      if(standby) {
+        standby=false; screenOff=false; lastTouch=now;
+        WiFi.mode(WIFI_STA); WiFi.begin(wifiName.c_str(),wifiPassword.c_str());
+        playing=resumePlaying; ++generation; clearAudio(); applyBrightness();
+      }
+    } else if(mv<4000 && seenUSB && !standby) {
+      if(!usbLostAt) usbLostAt=now;
+      if(now-usbLostAt>=10000) {
+        resumePlaying=playing; playing=false; ++generation; clearAudio();
+        standby=true; screenOff=true; applyBrightness();
+        WiFi.disconnect(false); WiFi.mode(WIFI_OFF);
+        if(btStartedForAudio) bluetooth.disconnect();
+      }
+    }
+  }
+  if(!standby && !screenOff && screenTimeout && now-lastTouch>=1000UL*screenTimeout) { screenOff=true; applyBrightness(); }
 }
 static String clockText(int seconds) { char b[24]; snprintf(b,sizeof(b),"%d:%02d",seconds/60,seconds%60); return String(b); }
 static void drawScreen() {
@@ -661,8 +708,8 @@ void setup() {
   M5.Display.setRotation(1);
   M5.Display.setBrightness(110);
   configureDevice();
-  prefs.begin("awc-radio",false); lastStation=prefs.getString("station",""); favorites=prefs.getULong64("favorites",0); brightness=prefs.getInt("bright",110); prefs.end();
-  M5.Display.setBrightness(brightness);
+  prefs.begin("awc-radio",false); lastStation=prefs.getString("station",""); favorites=prefs.getULong64("favorites",0); brightness=prefs.getInt("bright",110); nightBrightness=prefs.getInt("nightbright",40); screenTimeout=prefs.getInt("timeout",60); carMode=prefs.getBool("car",false); nightMode=prefs.getBool("night",false); prefs.end();
+  applyBrightness(); lastTouch=millis();
 
 
   audioMutex = xSemaphoreCreateMutex();
@@ -696,6 +743,8 @@ void setup() {
 
 void loop() {
   M5.update();
+  powerTick();
+  if(standby) { delay(100); return; }
   if(btEnabled && btStartedForAudio && selectedBT>=0 && hasAddr(savedBT[selectedBT].addr) && !bluetooth.is_connected() && !bluetooth.is_discovery_active() && millis()-lastBTAttempt>15000) {
     lastBTAttempt=millis(); bluetooth.connect_to(savedBT[selectedBT].addr);
   }
@@ -716,6 +765,8 @@ void loop() {
   if (M5.Touch.getCount()) {
     auto detail = M5.Touch.getDetail(0);
     if (detail.wasPressed()) {
+      lastTouch=millis();
+      if(screenOff) { screenOff=false; applyBrightness(); drawScreen(); return; }
       if(detail.y<30) {
         if(detail.x>=288 || detail.x<42) { prefs.begin("awc-radio",false); prefs.putBool("setup",true); prefs.end(); ESP.restart(); }
         else if(detail.x>=215) powerMenu();
@@ -734,7 +785,7 @@ void loop() {
     lastMetadata = millis();
     refreshMetadata();
   }
-  if (millis() - lastScreen > 500) {
+  if (!screenOff && millis() - lastScreen > 500) {
     lastScreen = millis();
     drawScreen();
   }
