@@ -58,7 +58,7 @@ static void tap(int &x,int &y) {
 }
 static String keyboard(const String &label,String value,bool secret=false) {
   int mode=0;
-  const char *rows[3][4]={{"1234567890","qwertyuiop","asdfghjkl","zxcvbnm.-/"},{"1234567890","QWERTYUIOP","ASDFGHJKL","ZXCVBNM.-/"},{"!@#$%^&*()","_+=:;?,~|","[]{}<>\\`","'\\" .-/"}};
+  const char *rows[3][4]={{"1234567890","qwertyuiop","asdfghjkl","zxcvbnm.-/"},{"1234567890","QWERTYUIOP","ASDFGHJKL","ZXCVBNM.-/"},{"!@#$%^&*()","_+=:;?,~|","[]{}<>\\`","'\".-/"}};
   while(true) {
     heading(label);
     String shown=value;
