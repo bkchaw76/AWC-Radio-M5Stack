@@ -344,7 +344,13 @@ static volatile uint32_t generation = 1;
 static volatile uint32_t lastAudioMillis = 0;
 static String stationNames[40];
 static int stationCount = 0, stationIndex = 0;
-static String title = "", artist = "";
+static String title = "", artist = "", nextTitle="", lastStation="";
+static double trackStart=0, trackEnd=0, elapsedBase=0;
+static unsigned long metadataAt=0;
+static uint64_t favorites=0;
+static int brightness=110;
+static bool logoDirty=true, logoOK=false;
+static M5Canvas logoCanvas(&M5.Display);
 static unsigned long lastMetadata = 0, lastScreen = 0;
 static bool streamOK = false;
 
@@ -472,6 +478,7 @@ static void refreshStations() {
     if (strlen(name)) stationNames[count++] = name;
   }
   stationCount = count;
+  for(int i=0;i<count;i++) if(stationNames[i]==lastStation) stationIndex=i;
   if (stationIndex >= stationCount) stationIndex = 0;
   Serial.printf("Loaded %d stations\n", stationCount);
 }
@@ -483,6 +490,11 @@ static void refreshMetadata() {
   if (readJson(path, doc)) {
     title = doc["title"].as<String>();
     artist = doc["artist"].as<String>();
+    nextTitle=doc["next_song"]["title"] | "";
+    trackStart=doc["start"] | 0.0; trackEnd=doc["end"] | 0.0;
+    // HTTP Date supplies server wall clock without requiring NTP.
+    elapsedBase=0; metadataAt=millis();
+    time_t now=time(nullptr); if(now>1700000000) elapsedBase=max(0.0,(double)now-trackStart);
   }
 }
 
@@ -491,7 +503,8 @@ static void selectStation(int change) {
   stationIndex = (stationIndex + change + stationCount) % stationCount;
   ++generation;
   clearAudio();
-  title = ""; artist = "";
+  title = ""; artist = ""; nextTitle=""; trackStart=trackEnd=0; logoDirty=true;
+  lastStation=stationNames[stationIndex]; prefs.begin("awc-radio",false); prefs.putString("station",lastStation); prefs.end();
   lastMetadata = 0;
   Serial.printf("Station: %s\n", stationNames[stationIndex].c_str());
 }
@@ -549,34 +562,96 @@ static void liveBluetooth() {
     lastBTAttempt=millis(); liveSwitching=false; return;
   }
 }
+static constexpr uint16_t BG=0x0862, GOLD=0xED6C, GREY=0xAD55, GREEN=0x56D0, BLUE=0x653F;
+static void fetchLogo() {
+  if(!logoDirty || !stationCount || WiFi.status()!=WL_CONNECTED) return;
+  logoDirty=false; logoOK=false;
+  HTTPClient http; http.useHTTP10(true); http.setTimeout(2500);
+  if(!http.begin(endpoint("/api/logo/"+encoded(stationNames[stationIndex])))) return;
+  if(http.GET()==200) {
+    int len=http.getSize();
+    if(len>0 && len<=512*1024) {
+      uint8_t *buf=(uint8_t*)ps_malloc(len);
+      if(buf) {
+        size_t got=http.getStream().readBytes(buf,len);
+        if(got==(size_t)len && (logoCanvas.width() || logoCanvas.createSprite(94,94))) {
+          logoCanvas.fillSprite(BG);
+          logoOK=logoCanvas.drawPng(buf,len,0,0,94,94,0,0,0.0f,0.0f);
+        }
+        free(buf);
+      }
+    }
+  }
+  http.end();
+}
+static void chooseStationMenu() {
+  int page=0; bool onlyFav=false;
+  while(true) {
+    heading(onlyFav?"Favorites":"Radio stations");
+    int ids[40], n=0;
+    for(int i=0;i<stationCount;i++) if(!onlyFav || (favorites&(1ULL<<i))) ids[n++]=i;
+    for(int i=0;i<4 && page+i<n;i++) keyBox(4,35+i*40,312,40,stationNames[ids[page+i]]);
+    keyBox(0,200,65,40,"PREV"); keyBox(65,200,65,40,"NEXT"); keyBox(130,200,110,40,onlyFav?"ALL":"FAVORITES"); keyBox(240,200,80,40,"BACK");
+    int x,y; tap(x,y);
+    if(y>=200) { if(x<65) page=max(0,page-4); else if(x<130) {if(page+4<n) page+=4;} else if(x<240) {onlyFav=!onlyFav;page=0;} else return; }
+    else if(y>=35 && y<195 && page+(y-35)/40<n) { selectStation(ids[page+(y-35)/40]-stationIndex); return; }
+  }
+}
+static void powerMenu() {
+  while(true) {
+    heading("Power settings");
+    M5.Display.setTextSize(2); M5.Display.setCursor(12,45); M5.Display.printf("Battery: %d%%",M5.Power.getBatteryLevel());
+    keyBox(4,90,150,50,"DIMMER"); keyBox(164,90,150,50,"BRIGHTER"); keyBox(4,190,312,45,"BACK");
+    int x,y; tap(x,y);
+    if(y>=190) return;
+    if(y>=90 && y<140) { brightness=constrain(brightness+(x<160?-20:20),20,255); M5.Display.setBrightness(brightness); prefs.begin("awc-radio",false); prefs.putInt("bright",brightness); prefs.end(); }
+  }
+}
+static String clockText(int seconds) { char b[24]; snprintf(b,sizeof(b),"%d:%02d",seconds/60,seconds%60); return String(b); }
 static void drawScreen() {
-  auto &d = M5.Display;
-  d.fillScreen(TFT_BLACK);
-  d.setTextColor(TFT_GREEN, TFT_BLACK);
-  d.setTextSize(2);
-  d.setCursor(12, 12);
-  d.print("AWC RADIO");
-  keyBox(244,4,76,32,"SETTINGS");
-  keyBox(174,4,70,32,"BT SWITCH");
-  d.setTextColor(TFT_WHITE, TFT_BLACK);
-  d.setCursor(12, 48);
-  d.print(stationCount ? stationNames[stationIndex] : "Loading stations...");
-  d.setTextSize(1);
-  d.setCursor(12, 92);
-  d.print(title.substring(0, 45));
-  d.setCursor(12, 110);
-  d.print(artist.substring(0, 45));
-  d.setCursor(12, 145);
-  d.printf("WiFi: %s  BT: %s", WiFi.status() == WL_CONNECTED ? "OK" : "OFF",
-           btName.c_str());
-  d.setCursor(12, 164);
-  d.printf("Audio: %s", streamOK ? "streaming" : "waiting");
-  d.drawLine(0, 189, 320, 189, TFT_DARKGREY);
-  d.setTextColor(TFT_CYAN, TFT_BLACK);
-  d.setTextSize(2);
-  d.setCursor(19, 205); d.print("< PREV");
-  d.setCursor(130, 205); d.print(playing ? "PAUSE" : "PLAY");
-  d.setCursor(243, 205); d.print("NEXT >");
+  auto &d=M5.Display;
+  static M5Canvas screen(&M5.Display);
+  if(!screen.width()) { screen.setColorDepth(16); screen.createSprite(320,240); }
+  if(!screen.width()) return;
+  fetchLogo();
+  auto &c=screen;
+  c.fillSprite(BG);
+  c.setTextColor(WiFi.status()==WL_CONNECTED?GREEN:GREY,BG); c.setTextSize(1); c.setCursor(8,9); c.print("WiFi");
+  c.setTextColor(TFT_WHITE,BG); c.setCursor(42,9); c.print("AWC RADIO");
+  c.setTextColor(btStartedForAudio && bluetooth.is_connected()?BLUE:GREY,BG); c.setCursor(151,9); c.print("BT");
+  c.setTextColor(streamOK && playing?GREEN:GREY,BG); c.setCursor(176,9); c.print(streamOK && playing?"LIVE":"IDLE");
+  int bat=M5.Power.getBatteryLevel(); bool charging=M5.Power.isCharging();
+  uint16_t bc=bat<15?TFT_RED:bat<30?GOLD:GREEN;
+  c.drawRect(220,7,20,10,bc); c.fillRect(240,10,2,4,bc);
+  c.fillRect(222,9,constrain(bat,0,100)*16/100,6,bc);
+  c.setTextColor(bc,BG); c.setCursor(245,9); if(charging)c.print("+"); if(bat>=0)c.printf("%d%%",bat); else c.print("--");
+  c.setTextColor(GREY,BG); c.setCursor(296,9); c.print("SET");
+  c.drawFastHLine(8,28,304,0x3186);
+  if(logoOK) logoCanvas.pushSprite(&c,8,38);
+  else { c.fillRoundRect(8,38,94,94,8,0x2104); c.setTextColor(GOLD); c.setCursor(25,78); c.print("RADIO"); }
+  c.setTextSize(1); c.setTextColor(GREY,BG); c.setCursor(110,43); c.print(stationCount?stationNames[stationIndex].substring(0,33):"Loading stations");
+  c.setTextSize(2); c.setTextColor(TFT_WHITE,BG); c.setCursor(110,64);
+  String t=title.length()?title:"Waiting...";
+  if(t.length()>17) { int offset=(millis()/350)%(t.length()+4); t=(t+"    "+t).substring(offset,offset+17); }
+  c.print(t.substring(0,17));
+  c.setTextSize(1); c.setTextColor(GREY,BG); c.setCursor(110,98); c.print(artist.substring(0,33));
+  int duration=max(0,(int)(trackEnd-trackStart));
+  bool timed=duration>0 && time(nullptr)>1700000000;
+  int elapsed=timed?constrain((int)(elapsedBase+(millis()-metadataAt)/1000),0,duration):0;
+  c.fillRoundRect(8,140,304,4,2,0x3186);
+  if(timed && elapsed) c.fillRoundRect(8,140,304*elapsed/duration,4,2,GOLD);
+  c.setCursor(8,151); c.print(timed?clockText(elapsed):"--:--");
+  c.setCursor(276,151); c.print(duration?clockText(duration):"--:--");
+  // Five large touch targets, matching the reference.
+  c.fillTriangle(32,180,32,202,18,191,TFT_WHITE); c.fillRect(15,180,3,22,TFT_WHITE);
+  bool fav=stationCount && (favorites&(1ULL<<stationIndex));
+  for(int i=0;i<10;i++) { float a=-PI/2+i*PI/5,b=-PI/2+(i+1)*PI/5; int r=i%2?6:13,rr=(i+1)%2?6:13; c.drawLine(88+cos(a)*r,191+sin(a)*r,88+cos(b)*rr,191+sin(b)*rr,fav?GOLD:GREY); }
+  c.fillCircle(160,191,21,GOLD);
+  if(playing) {c.fillRect(153,183,5,16,BG);c.fillRect(162,183,5,16,BG);} else c.fillTriangle(154,181,154,201,169,191,BG);
+  for(int i=0;i<3;i++) c.fillRoundRect(221,181+i*8,22-i*4,3,1,TFT_WHITE);
+  c.fillTriangle(287,180,287,202,301,191,TFT_WHITE); c.fillRect(301,180,3,22,TFT_WHITE);
+  c.setTextColor(GREY,BG); c.setCursor(8,224); c.print("Next up: "+nextTitle.substring(0,41));
+  c.pushSprite(0,0);
 }
 
 void setup() {
@@ -586,6 +661,9 @@ void setup() {
   M5.Display.setRotation(1);
   M5.Display.setBrightness(110);
   configureDevice();
+  prefs.begin("awc-radio",false); lastStation=prefs.getString("station",""); favorites=prefs.getULong64("favorites",0); brightness=prefs.getInt("bright",110); prefs.end();
+  M5.Display.setBrightness(brightness);
+
 
   audioMutex = xSemaphoreCreateMutex();
   pcmRing = (Frame *)ps_malloc(RING_FRAMES * sizeof(Frame));
@@ -597,6 +675,7 @@ void setup() {
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
   WiFi.begin(wifiName.c_str(), wifiPassword.c_str());
+  configTime(0,0,"pool.ntp.org","time.google.com");
   Serial.println("Connecting WiFi...");
   const unsigned long start = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) delay(250);
@@ -637,14 +716,16 @@ void loop() {
   if (M5.Touch.getCount()) {
     auto detail = M5.Touch.getDetail(0);
     if (detail.wasPressed()) {
-      if (detail.y < 35 && detail.x >= 174 && detail.x < 244) { liveBluetooth(); drawScreen(); }
-      if (detail.y < 35 && detail.x >= 244) {
-        prefs.begin("awc-radio",false); prefs.putBool("setup",true); prefs.end(); ESP.restart();
-      }
-      if (detail.y > 185) {
-        if (detail.x < 110) selectStation(-1);
-        else if (detail.x > 220) selectStation(1);
-        else { playing = !playing; ++generation; clearAudio(); }
+      if(detail.y<30) {
+        if(detail.x>=288 || detail.x<42) { prefs.begin("awc-radio",false); prefs.putBool("setup",true); prefs.end(); ESP.restart(); }
+        else if(detail.x>=215) powerMenu();
+        else if(detail.x>=145 && detail.x<175) liveBluetooth();
+      } else if(detail.y>=170 && detail.y<216) {
+        if(detail.x<56) selectStation(-1);
+        else if(detail.x<120 && stationCount) { favorites^=1ULL<<stationIndex; prefs.begin("awc-radio",false); prefs.putULong64("favorites",favorites); prefs.end(); }
+        else if(detail.x<200) { playing=!playing; ++generation; clearAudio(); }
+        else if(detail.x<265) chooseStationMenu();
+        else selectStation(1);
       }
       drawScreen();
     }
@@ -653,7 +734,7 @@ void loop() {
     lastMetadata = millis();
     refreshMetadata();
   }
-  if (millis() - lastScreen > 2000) {
+  if (millis() - lastScreen > 500) {
     lastScreen = millis();
     drawScreen();
   }
