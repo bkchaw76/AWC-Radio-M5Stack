@@ -4,6 +4,7 @@
 #include <Preferences.h>
 #include <WebServer.h>
 #include <Update.h>
+#include <SPIFFS.h>
 #include <esp_ota_ops.h>
 #include <esp_system.h>
 #include <ArduinoJson.h>
@@ -422,6 +423,7 @@ static bool carMode=false, nightMode=false, standby=false, screenOff=false, resu
 static unsigned long lastTouch=0, usbLostAt=0, lastPowerPoll=0;
 static volatile bool prebuffer=true;
 static bool logoDirty=true, logoOK=false;
+static unsigned long logoRetryAt=0;
 static M5Canvas logoCanvas(&M5.Display);
 static unsigned long lastMetadata = 0, lastScreen = 0;
 static bool streamOK = false;
@@ -578,7 +580,7 @@ static void selectStation(int change) {
   stationIndex = (stationIndex + change + stationCount) % stationCount;
   ++generation;
   clearAudio();
-  title = ""; artist = ""; nextTitle=""; trackStart=trackEnd=0; logoDirty=true;
+  title = ""; artist = ""; nextTitle=""; trackStart=trackEnd=0; logoDirty=true; logoOK=false; logoRetryAt=0;
   lastStation=stationNames[stationIndex]; prefs.begin("awc-radio",false); prefs.putString("station",lastStation); prefs.end();
   lastMetadata = 0;
   Serial.printf("Station: %s\n", stationNames[stationIndex].c_str());
@@ -638,9 +640,43 @@ static void liveBluetooth() {
   }
 }
 static constexpr uint16_t UI_BG=0x0862, UI_GOLD=0xED6C, UI_GREY=0xAD55, UI_GREEN=0x56D0, UI_BLUE=0x653F;
+static bool cacheReady=false;
+static String logoPath() {
+  uint64_t hash=14695981039346656037ULL;
+  String key=radioURL+"/"+stationNames[stationIndex];
+  for(size_t i=0;i<key.length();i++) { hash^=(uint8_t)key[i]; hash*=1099511628211ULL; }
+  char name[32]; snprintf(name,sizeof(name),"/l%016llx.raw",(unsigned long long)hash);
+  return String(name);
+}
+static bool loadCachedLogo(const String &path) {
+  if(!cacheReady) return false;
+  File file=SPIFFS.open(path,"r");
+  constexpr size_t bytes=94*94*2;
+  if(!file || file.size()!=bytes) return false;
+  if(!logoCanvas.width()) { logoCanvas.setColorDepth(16); logoCanvas.createSprite(94,94); }
+  if(!logoCanvas.width()) return false;
+  return file.read((uint8_t*)logoCanvas.getBuffer(),bytes)==bytes;
+}
+static void saveCachedLogo(const String &path) {
+  if(!cacheReady || !logoCanvas.width()) return;
+  constexpr size_t bytes=94*94*2;
+  if(SPIFFS.totalBytes()-SPIFFS.usedBytes()<bytes+8192) return;
+  SPIFFS.remove("/logo.tmp");
+  File file=SPIFFS.open("/logo.tmp","w");
+  if(!file) return;
+  size_t written=file.write((const uint8_t*)logoCanvas.getBuffer(),bytes);
+  file.close();
+  if(written==bytes) { SPIFFS.remove(path); SPIFFS.rename("/logo.tmp",path); }
+  else SPIFFS.remove("/logo.tmp");
+}
 static void fetchLogo() {
-  if(!logoDirty || !stationCount || WiFi.status()!=WL_CONNECTED) return;
-  logoDirty=false; logoOK=false;
+  if(!logoDirty || !stationCount) return;
+  if(logoRetryAt && (int32_t)(millis()-logoRetryAt)<0) return;
+  logoOK=false;
+  String path=logoPath();
+  if(loadCachedLogo(path)) { logoOK=true; logoDirty=false; return; }
+  if(WiFi.status()!=WL_CONNECTED) { logoRetryAt=millis()+5000; return; }
+  logoRetryAt=millis()+15000;
   HTTPClient http; http.useHTTP10(true); http.setTimeout(2500);
   if(!http.begin(endpoint("/api/logo/"+encoded(stationNames[stationIndex])))) return;
   if(http.GET()==200) {
@@ -649,15 +685,32 @@ static void fetchLogo() {
       uint8_t *buf=(uint8_t*)ps_malloc(len);
       if(buf) {
         size_t got=http.getStream().readBytes(buf,len);
-        if(got==(size_t)len && (logoCanvas.width() || logoCanvas.createSprite(94,94))) {
+        if(!logoCanvas.width()) { logoCanvas.setColorDepth(16); logoCanvas.createSprite(94,94); }
+        if(got==(size_t)len && logoCanvas.width()) {
           logoCanvas.fillSprite(UI_BG);
           logoOK=logoCanvas.drawPng(buf,len,0,0,94,94,0,0,0.0f,0.0f);
+          if(logoOK) { saveCachedLogo(path); logoDirty=false; }
         }
         free(buf);
       }
     }
   }
   http.end();
+}
+static void clearLogoCache() {
+  if(!cacheReady) { heading("Cache unavailable"); delay(1200); return; }
+  heading("Clear logo cache?");
+  keyBox(0,100,160,60,"CANCEL"); keyBox(160,100,160,60,"CLEAR");
+  int x,y; tap(x,y); if(x<160 || y<100 || y>=160) return;
+  File root=SPIFFS.open("/");
+  File file=root.openNextFile();
+  while(file) {
+    String name=file.name(); file.close();
+    if(!name.startsWith("/")) name="/"+name;
+    if((name.startsWith("/l") && name.endsWith(".raw") && name.length()==22) || name=="/logo.tmp") SPIFFS.remove(name);
+    file=root.openNextFile();
+  }
+  root.close(); logoDirty=true; logoOK=false; logoRetryAt=0;
 }
 static void chooseStationMenu() {
   int page=0; bool onlyFav=false;
@@ -741,13 +794,13 @@ static void systemMenu() {
     heading("System settings");
     keyBox(4,45,312,42,"WiFi / Bluetooth / Server setup");
     keyBox(4,90,312,42,"OTA firmware update");
-    keyBox(4,135,312,42,"Diagnostics");
+    keyBox(4,135,150,42,"Diagnostics"); keyBox(164,135,150,42,"Clear logo cache");
     keyBox(4,190,312,45,"BACK");
     int x,y; tap(x,y);
     if(y>=190) return;
     if(y>=45 && y<87) { prefs.begin("awc-radio",false); prefs.putBool("setup",true); prefs.end(); ESP.restart(); }
     if(y>=90 && y<132) otaMenu();
-    if(y>=135 && y<177) diagnosticsMenu();
+    if(y>=135 && y<177) { if(x<160) diagnosticsMenu(); else clearLogoCache(); }
   }
 }
 static void powerMenu() {
@@ -848,6 +901,8 @@ void setup() {
   M5.Display.setRotation(1);
   M5.Display.setBrightness(110);
   configureDevice();
+  cacheReady=SPIFFS.begin(false);
+  if(!cacheReady) Serial.println("Logo cache unavailable; using network artwork");
   prefs.begin("awc-radio",false); lastStation=prefs.getString("station",""); favorites=prefs.getULong64("favorites",0); brightness=prefs.getInt("bright",110); nightBrightness=prefs.getInt("nightbright",40); screenTimeout=prefs.getInt("timeout",60); carMode=prefs.getBool("car",false); nightMode=prefs.getBool("night",false); prefs.end();
   applyBrightness(); lastTouch=millis();
 
