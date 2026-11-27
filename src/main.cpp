@@ -411,6 +411,8 @@ static Frame *pcmRing = nullptr;
 static constexpr size_t RING_FRAMES = 32768; // 128 KB PSRAM, ~0.74 s PCM
 static size_t ringRead = 0, ringWrite = 0, ringCount = 0;
 static volatile bool playing = false;
+static volatile int audioVolume=100;
+static volatile bool audioMuted=false;
 static volatile uint32_t generation = 1;
 static volatile uint32_t lastAudioMillis = 0;
 static volatile uint32_t streamHeartbeat=0;
@@ -466,8 +468,11 @@ static int32_t bluetoothFrames(Frame *dst, int32_t requested) {
   if (xSemaphoreTake(audioMutex, 0) != pdTRUE) return requested;
   if(prebuffer && ringCount<11025) { xSemaphoreGive(audioMutex); return requested; }
   prebuffer=false;
+  const int gain=audioMuted?0:audioVolume;
   for (int32_t i = 0; i < requested && ringCount; ++i) {
     dst[i] = pcmRing[ringRead];
+    dst[i].channel1=(int32_t)dst[i].channel1*gain/100;
+    dst[i].channel2=(int32_t)dst[i].channel2*gain/100;
     ringRead = (ringRead + 1) % RING_FRAMES;
     --ringCount;
   }
@@ -800,6 +805,26 @@ static void diagnosticsMenu() {
   M5.Display.printf("Stream resets: %lu\nWatchdog: %s\n",(unsigned long)streamRecoveries,streamWatchdogReady?"ON":"OFF");
   keyBox(4,190,312,45,"BACK"); int x,y; do {tap(x,y);} while(y<190);
 }
+static void volumeMenu() {
+  while(true) {
+    heading("Audio volume");
+    M5.Display.setTextSize(2); M5.Display.setCursor(12,45);
+    M5.Display.printf("%d%% %s",(int)audioVolume,audioMuted?"MUTED":"");
+    M5.Display.drawRect(12,80,296,16,TFT_WHITE);
+    M5.Display.fillRect(14,82,292*audioVolume/100,12,TFT_ORANGE);
+    keyBox(4,110,100,60,"VOL -"); keyBox(110,110,100,60,audioMuted?"UNMUTE":"MUTE"); keyBox(216,110,100,60,"VOL +");
+    keyBox(4,190,312,45,"BACK");
+    int x,y; tap(x,y);
+    if(y>=190) { lastTouch=millis(); return; }
+    if(y>=70 && y<105) audioVolume=constrain((x-12)*100/296,0,100);
+    else if(y>=110 && y<170) {
+      if(x<108) audioVolume=max(0,(int)audioVolume-5);
+      else if(x<214) audioMuted=!audioMuted;
+      else audioVolume=min(100,(int)audioVolume+5);
+    }
+    prefs.begin("awc-radio",false); prefs.putInt("volume",audioVolume); prefs.putBool("muted",audioMuted); prefs.end();
+  }
+}
 static void systemMenu() {
   while(true) {
     heading("System settings");
@@ -886,6 +911,7 @@ static void drawScreen() {
   if(t.length()>17) { int offset=(millis()/350)%(t.length()+4); t=(t+"    "+t).substring(offset,offset+17); }
   c.print(t.substring(0,17));
   c.setTextSize(1); c.setTextColor(UI_GREY,UI_BG); c.setCursor(110,98); c.print(artist.substring(0,33));
+  c.setTextColor(UI_GOLD,UI_BG); c.setCursor(110,119); c.printf(audioMuted?"MUTED  (tap)":"VOL %d%%  (tap)",(int)audioVolume);
   int duration=max(0,(int)(trackEnd-trackStart));
   bool timed=duration>0 && time(nullptr)>1700000000;
   int elapsed=timed?constrain((int)(elapsedBase+(millis()-metadataAt)/1000),0,duration):0;
@@ -915,6 +941,7 @@ void setup() {
   cacheReady=SPIFFS.begin(false);
   if(!cacheReady) Serial.println("Logo cache unavailable; using network artwork");
   prefs.begin("awc-radio",false); lastStation=prefs.getString("station",""); favorites=prefs.getULong64("favorites",0); brightness=prefs.getInt("bright",110); nightBrightness=prefs.getInt("nightbright",40); screenTimeout=prefs.getInt("timeout",60); carMode=prefs.getBool("car",false); nightMode=prefs.getBool("night",false); prefs.end();
+  prefs.begin("awc-radio",false); audioVolume=constrain(prefs.getInt("volume",100),0,100); audioMuted=prefs.getBool("muted",false); prefs.end();
   applyBrightness(); lastTouch=millis();
 
 
@@ -985,7 +1012,8 @@ void loop() {
         if(detail.x>=288 || detail.x<42) systemMenu();
         else if(detail.x>=215) powerMenu();
         else if(detail.x>=145 && detail.x<175) liveBluetooth();
-      } else if(detail.y>=170 && detail.y<216) {
+      } else if(detail.y>=110 && detail.y<136 && detail.x>=105) volumeMenu();
+      else if(detail.y>=170 && detail.y<216) {
         if(detail.x<56) selectStation(-1);
         else if(detail.x<120 && stationCount) { favorites^=1ULL<<stationIndex; prefs.begin("awc-radio",false); prefs.putULong64("favorites",favorites); prefs.end(); }
         else if(detail.x<200) { playing=!playing; ++generation; clearAudio(); }
