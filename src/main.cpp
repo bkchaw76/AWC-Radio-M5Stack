@@ -463,6 +463,9 @@ static void configureDevice() {
 
 static BluetoothA2DPSource bluetooth;
 static bool btStartedForAudio=false;
+static volatile bool receiverReady=false;
+static unsigned long btRetryInterval=15000;
+static unsigned long btConnectedAt=0;
 static unsigned long lastBTAttempt=0;
 static volatile bool liveSwitching=false;
 static SemaphoreHandle_t audioMutex;
@@ -578,7 +581,7 @@ static void networkTask(void *) {
   streamWatchdogReady=(esp_task_wdt_add(nullptr)==ESP_OK);
   while (true) {
     streamHeartbeat=millis(); if(streamWatchdogReady) esp_task_wdt_reset();
-    if (liveSwitching || !btEnabled || !playing || stationCount == 0 || WiFi.status() != WL_CONNECTED) {
+    if (liveSwitching || !receiverReady || !btEnabled || !playing || stationCount == 0 || WiFi.status() != WL_CONNECTED) {
       vTaskDelay(pdMS_TO_TICKS(300));
       continue;
     }
@@ -598,7 +601,7 @@ static void networkTask(void *) {
       decoderSession=session;
       decoder.begin();
       lastAudioMillis = millis();
-      while (playing && generation == session && WiFi.status() == WL_CONNECTED) {
+      while (playing && receiverReady && generation == session && WiFi.status() == WL_CONNECTED) {
         streamHeartbeat=millis(); if(streamWatchdogReady) esp_task_wdt_reset();
         int available = client.available();
         if (available > 0) {
@@ -729,7 +732,7 @@ static void liveBluetooth() {
       heading("Scan device in setup"); delay(1500); continue;
     }
     if(target==selectedBT && btEnabled && btStartedForAudio && bluetooth.is_connected()) return;
-    liveSwitching=true;
+    liveSwitching=true; receiverReady=false;
     ++generation; clearAudio();
     heading("Switching receiver");
     if(btStartedForAudio) {
@@ -755,7 +758,7 @@ static void liveBluetooth() {
         bluetooth.connect_to(savedBT[selectedBT].addr);
       }
     }
-    lastBTAttempt=millis(); liveSwitching=false; return;
+    lastBTAttempt=millis(); btRetryInterval=15000; liveSwitching=false; return;
   }
 }
 static constexpr uint16_t UI_BG=0x0862, UI_GOLD=0xED6C, UI_GREY=0xAD55, UI_GREEN=0x56D0, UI_BLUE=0x653F;
@@ -976,6 +979,10 @@ static void powerTick() {
         standby=false; screenOff=false; lastTouch=now;
         WiFi.mode(WIFI_STA); connectSavedWifi(false);
         playing=resumePlaying; ++generation; clearAudio(); applyBrightness();
+        if(btEnabled && btStartedForAudio && selectedBT>=0 && hasAddr(savedBT[selectedBT].addr)) {
+          bluetooth.set_auto_reconnect(savedBT[selectedBT].addr); bluetooth.connect_to(savedBT[selectedBT].addr); lastBTAttempt=now;
+        }
+        btRetryInterval=15000;
       }
     } else if(mv<4000 && seenUSB && !standby) {
       if(!usbLostAt) usbLostAt=now;
@@ -983,7 +990,8 @@ static void powerTick() {
         resumePlaying=playing; playing=false; ++generation; clearAudio();
         standby=true; screenOff=true; applyBrightness();
         WiFi.disconnect(false); WiFi.mode(WIFI_OFF);
-        if(btStartedForAudio) bluetooth.disconnect();
+        receiverReady=false;
+        if(btStartedForAudio) { bluetooth.set_auto_reconnect(false); bluetooth.disconnect(); }
       }
     }
   }
@@ -1107,8 +1115,16 @@ void loop() {
     Serial.println("Recovery: restarting stalled stream");
   }
   if(streamHeartbeat && now-streamHeartbeat>45000) { Serial.println("Recovery: stream task unresponsive"); ESP.restart(); }
-  if(btEnabled && btStartedForAudio && selectedBT>=0 && hasAddr(savedBT[selectedBT].addr) && !bluetooth.is_connected() && !bluetooth.is_discovery_active() && millis()-lastBTAttempt>15000) {
-    lastBTAttempt=millis(); bluetooth.connect_to(savedBT[selectedBT].addr);
+  bool connected=btEnabled && btStartedForAudio && !liveSwitching && bluetooth.is_connected();
+  if(connected!=receiverReady) {
+    receiverReady=connected; ++generation; clearAudio();
+    if(connected) { btConnectedAt=now; Serial.println("Bluetooth connected; buffering live audio"); }
+    else { lastBTAttempt=now; Serial.println("Bluetooth disconnected; suspending stream"); }
+  }
+  if(connected && now-btConnectedAt>10000) btRetryInterval=15000;
+  if(btEnabled && btStartedForAudio && selectedBT>=0 && hasAddr(savedBT[selectedBT].addr) && !connected && !bluetooth.is_discovery_active() && now-lastBTAttempt>=btRetryInterval) {
+    lastBTAttempt=now; bluetooth.connect_to(savedBT[selectedBT].addr);
+    btRetryInterval=min(60000UL,btRetryInterval*2);
   }
   checkServers();
   if (WiFi.status() != WL_CONNECTED) {
