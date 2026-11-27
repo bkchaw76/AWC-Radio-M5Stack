@@ -6,11 +6,11 @@
 #include <BluetoothA2DPSource.h>
 #include "AudioTools/Communication/AudioHttp.h"
 #include "MP3DecoderHelix.h"
-#include "config.example.h"
-
-// Override settings through include/config.h (never committed).
+// Local credentials override the public example (which never contains secrets).
 #if __has_include("config.h")
 #include "config.h"
+#else
+#include "config.example.h"
 #endif
 
 using audio_tools::URLStream;
@@ -149,7 +149,7 @@ static void refreshStations() {
   }
   stationCount = count;
   if (stationIndex >= stationCount) stationIndex = 0;
-  Serial.printf("Loaded %d stations\\n", stationCount);
+  Serial.printf("Loaded %d stations\n", stationCount);
 }
 
 static void refreshMetadata() {
@@ -169,7 +169,7 @@ static void selectStation(int change) {
   clearAudio();
   title = ""; artist = "";
   lastMetadata = 0;
-  Serial.printf("Station: %s\\n", stationNames[stationIndex].c_str());
+  Serial.printf("Station: %s\n", stationNames[stationIndex].c_str());
 }
 
 static void drawScreen() {
