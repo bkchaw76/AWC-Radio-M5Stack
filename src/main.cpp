@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <Preferences.h>
 #include <WebServer.h>
@@ -36,7 +37,51 @@
 #endif
 
 using libhelix::MP3DecoderHelix;
-static String wifiName, wifiPassword, btName, radioURL;
+static String wifiName, wifiPassword, btName, radioURL, radioUser, radioPass;
+static const char ROOT_CA[] = R"PEM(-----BEGIN CERTIFICATE-----
+MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw
+TzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2Vh
+cmNoIEdyb3VwMRUwEwYDVQQDEwxJU1JHIFJvb3QgWDEwHhcNMTUwNjA0MTEwNDM4
+WhcNMzUwNjA0MTEwNDM4WjBPMQswCQYDVQQGEwJVUzEpMCcGA1UEChMgSW50ZXJu
+ZXQgU2VjdXJpdHkgUmVzZWFyY2ggR3JvdXAxFTATBgNVBAMTDElTUkcgUm9vdCBY
+MTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIBAK3oJHP0FDfzm54rVygc
+h77ct984kIxuPOZXoHj3dcKi/vVqbvYATyjb3miGbESTtrFj/RQSa78f0uoxmyF+
+0TM8ukj13Xnfs7j/EvEhmkvBioZxaUpmZmyPfjxwv60pIgbz5MDmgK7iS4+3mX6U
+A5/TR5d8mUgjU+g4rk8Kb4Mu0UlXjIB0ttov0DiNewNwIRt18jA8+o+u3dpjq+sW
+T8KOEUt+zwvo/7V3LvSye0rgTBIlDHCNAymg4VMk7BPZ7hm/ELNKjD+Jo2FR3qyH
+B5T0Y3HsLuJvW5iB4YlcNHlsdu87kGJ55tukmi8mxdAQ4Q7e2RCOFvu396j3x+UC
+B5iPNgiV5+I3lg02dZ77DnKxHZu8A/lJBdiB3QW0KtZB6awBdpUKD9jf1b0SHzUv
+KBds0pjBqAlkd25HN7rOrFleaJ1/ctaJxQZBKT5ZPt0m9STJEadao0xAH0ahmbWn
+OlFuhjuefXKnEgV4We0+UXgVCwOPjdAvBbI+e0ocS3MFEvzG6uBQE3xDk3SzynTn
+jh8BCNAw1FtxNrQHusEwMFxIt4I7mKZ9YIqioymCzLq9gwQbooMDQaHWBfEbwrbw
+qHyGO0aoSCqI3Haadr8faqU9GY/rOPNk3sgrDQoo//fb4hVC1CLQJ13hef4Y53CI
+rU7m2Ys6xt0nUW7/vGT1M0NPAgMBAAGjQjBAMA4GA1UdDwEB/wQEAwIBBjAPBgNV
+HRMBAf8EBTADAQH/MB0GA1UdDgQWBBR5tFnme7bl5AFzgAiIyBpY9umbbjANBgkq
+hkiG9w0BAQsFAAOCAgEAVR9YqbyyqFDQDLHYGmkgJykIrGF1XIpu+ILlaS/V9lZL
+ubhzEFnTIZd+50xx+7LSYK05qAvqFyFWhfFQDlnrzuBZ6brJFe+GnY+EgPbk6ZGQ
+3BebYhtF8GaV0nxvwuo77x/Py9auJ/GpsMiu/X1+mvoiBOv/2X/qkSsisRcOj/KK
+NFtY2PwByVS5uCbMiogziUwthDyC3+6WVwW6LLv3xLfHTjuCvjHIInNzktHCgKQ5
+ORAzI4JMPJ+GslWYHb4phowim57iaztXOoJwTdwJx4nLCgdNbOhdjsnvzqvHu7Ur
+TkXWStAmzOVyyghqpZXjFaH3pO3JLF+l+/+sKAIuvtd7u+Nxe5AW0wdeRlN8NwdC
+jNPElpzVmbUq4JUagEiuTDkHzsxHpFKVK7q4+63SM1N95R1NbdWhscdCb+ZAJzVc
+oyi3B43njTOQ5yOf+1CceWxG1bQVs5ZufpsMljq4Ui0/1lvh+wjChP4kqKOJ2qxq
+4RgqsahDYVvTH9w7jXbyLeiNdd8XM2w9U/t7y0Ff/9yi0GE44Za4rF2LN9d11TPA
+mRGunUHBcnWEvgJBQl9nJEiU0Zsnvgc/ubhPgXRR4Xq37Z0j4r7g1SgEEzwxA57d
+emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=
+-----END CERTIFICATE-----
+)PEM";
+static bool validURL(const String &url) { return (url.startsWith("http://") || url.startsWith("https://")) && url.indexOf('@')<0; }
+static bool beginRadio(HTTPClient &http, WiFiClient &plain, WiFiClientSecure &tls, const String &url) {
+  if(!validURL(url)) return false;
+  if(url.startsWith("https://")) {
+    if(time(nullptr)<1700000000) return false;
+    tls.setCACert(ROOT_CA); tls.setHandshakeTimeout(8);
+    if(!http.begin(tls,url)) return false;
+    if(radioUser.length()) http.setAuthorization(radioUser.c_str(),radioPass.c_str());
+  } else { if(!http.begin(plain,url)) return false; }
+  http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+  return true;
+}
 static Preferences prefs;
 static WebServer setupServer(80);
 
@@ -342,10 +387,10 @@ static bool lcdSetup() {
     int x,y; tap(x,y);
     if(y>=35 && y<75) wifiManager();
     else if(y>=75 && y<115) manageBluetooth();
-    else if(y>=115 && y<155) radioURL=keyboard("Radio server URL",radioURL);
+    else if(y>=115 && y<155) { radioURL=keyboard("Radio server URL",radioURL); if(radioURL.startsWith("https://")) { radioUser=keyboard("HTTPS user (optional)",radioUser); radioPass=keyboard("HTTPS password",radioPass,true); } }
     else if(y>=155 && y<195) {
-      if(!wifiName.length() || wifiName=="YOUR_IPHONE_HOTSPOT" || (btEnabled && (!btName.length() || btName=="YOUR_CAR_BLUETOOTH_NAME")) || !radioURL.startsWith("http://")) { heading("Check settings"); delay(1200); continue; }
-      prefs.putString("ssid",wifiName); prefs.putString("password",wifiPassword); prefs.putString("bt",btName); prefs.putString("url",radioURL);
+      if(!wifiName.length() || wifiName=="YOUR_IPHONE_HOTSPOT" || (btEnabled && (!btName.length() || btName=="YOUR_CAR_BLUETOOTH_NAME")) || !validURL(radioURL)) { heading("Check settings"); delay(1200); continue; }
+      prefs.putString("ssid",wifiName); prefs.putString("password",wifiPassword); prefs.putString("bt",btName); prefs.putString("url",radioURL); prefs.putString("ruser",radioUser); prefs.putString("rpass",radioPass);
       prefs.end(); ESP.restart(); return true;
     } else if(y>=195) return false;
   }
@@ -358,6 +403,7 @@ static void configureDevice() {
   btName = prefs.getString("bt", BT_SPEAKER_NAME);
   loadBT();
   radioURL = prefs.getString("url", RADIO_SERVER_URL);
+  radioUser=prefs.getString("ruser",""); radioPass=prefs.getString("rpass","");
   bool forceSetup=prefs.getBool("setup",false); prefs.remove("setup");
   // Hold the touchscreen during startup to reopen setup.
   delay(600);
@@ -384,14 +430,14 @@ static void configureDevice() {
   });
   setupServer.on("/save", HTTP_POST, []() {
     String url = setupServer.arg("url");
-    if (!setupServer.arg("ssid").length() || !setupServer.arg("bt").length() || !url.startsWith("http://")) {
+    if (!setupServer.arg("ssid").length() || !setupServer.arg("bt").length() || !validURL(url)) {
       setupServer.send(400, "text/plain", "SSID, Bluetooth name and http:// server URL required");
       return;
     }
     wifiCount=1; wifiIndex=0; savedSSID[0]=setupServer.arg("ssid"); savedPass[0]=setupServer.arg("password"); saveWifi();
     prefs.putString("bt", setupServer.arg("bt"));
     selectedBT=-1; btEnabled=true; saveBT();
-    prefs.putString("url", url);
+    prefs.putString("url", url); prefs.remove("ruser"); prefs.remove("rpass");
     setupServer.send(200, "text/plain", "Saved. Restarting...");
     delay(500);
     prefs.end();
@@ -516,14 +562,15 @@ static void networkTask(void *) {
     const uint32_t session = generation;
     const String path = "/api/stations/" + encoded(stationNames[stationIndex]) + "/stream";
     const String address = endpoint(path);
-    WiFiClient client;
+    WiFiClient plain; WiFiClientSecure tls;
     HTTPClient http;
     http.useHTTP10(true); // close-delimited body, no HTTP/1.1 chunk framing
     http.setConnectTimeout(5000);
     http.setTimeout(8000);
     MP3DecoderHelix decoder(decoded);
     clearAudio();
-    if (http.begin(client, address) && http.GET() == HTTP_CODE_OK) {
+    if (beginRadio(http,plain,tls,address) && http.GET() == HTTP_CODE_OK) {
+      WiFiClient &client=http.getStream();
       streamOK = true;
       decoder.begin();
       lastAudioMillis = millis();
@@ -552,7 +599,8 @@ static bool readJson(const String &path, JsonDocument &doc) {
   HTTPClient http;
   http.useHTTP10(true);
   http.setTimeout(5000);
-  if (!http.begin(endpoint(path))) return false;
+  WiFiClient plain; WiFiClientSecure tls;
+  if (!beginRadio(http,plain,tls,endpoint(path))) return false;
   const int status = http.GET();
   if (status != HTTP_CODE_OK) { http.end(); return false; }
   DeserializationError err = deserializeJson(doc, http.getStream());
@@ -693,7 +741,8 @@ static void fetchLogo() {
   if(WiFi.status()!=WL_CONNECTED) { logoRetryAt=millis()+5000; return; }
   logoRetryAt=millis()+15000;
   HTTPClient http; http.useHTTP10(true); http.setTimeout(2500);
-  if(!http.begin(endpoint("/api/logo/"+encoded(stationNames[stationIndex])))) return;
+  WiFiClient plain; WiFiClientSecure tls;
+  if(!beginRadio(http,plain,tls,endpoint("/api/logo/"+encoded(stationNames[stationIndex])))) return;
   if(http.GET()==200) {
     int len=http.getSize();
     if(len>0 && len<=512*1024) {
