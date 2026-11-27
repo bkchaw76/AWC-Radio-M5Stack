@@ -562,7 +562,7 @@ static void liveBluetooth() {
     lastBTAttempt=millis(); liveSwitching=false; return;
   }
 }
-static constexpr uint16_t BG=0x0862, GOLD=0xED6C, GREY=0xAD55, GREEN=0x56D0, BLUE=0x653F;
+static constexpr uint16_t UI_BG=0x0862, UI_GOLD=0xED6C, UI_GREY=0xAD55, UI_GREEN=0x56D0, UI_BLUE=0x653F;
 static void fetchLogo() {
   if(!logoDirty || !stationCount || WiFi.status()!=WL_CONNECTED) return;
   logoDirty=false; logoOK=false;
@@ -575,7 +575,7 @@ static void fetchLogo() {
       if(buf) {
         size_t got=http.getStream().readBytes(buf,len);
         if(got==(size_t)len && (logoCanvas.width() || logoCanvas.createSprite(94,94))) {
-          logoCanvas.fillSprite(BG);
+          logoCanvas.fillSprite(UI_BG);
           logoOK=logoCanvas.drawPng(buf,len,0,0,94,94,0,0,0.0f,0.0f);
         }
         free(buf);
@@ -615,42 +615,42 @@ static void drawScreen() {
   if(!screen.width()) return;
   fetchLogo();
   auto &c=screen;
-  c.fillSprite(BG);
-  c.setTextColor(WiFi.status()==WL_CONNECTED?GREEN:GREY,BG); c.setTextSize(1); c.setCursor(8,9); c.print("WiFi");
-  c.setTextColor(TFT_WHITE,BG); c.setCursor(42,9); c.print("AWC RADIO");
-  c.setTextColor(btStartedForAudio && bluetooth.is_connected()?BLUE:GREY,BG); c.setCursor(151,9); c.print("BT");
-  c.setTextColor(streamOK && playing?GREEN:GREY,BG); c.setCursor(176,9); c.print(streamOK && playing?"LIVE":"IDLE");
+  c.fillSprite(UI_BG);
+  c.setTextColor(WiFi.status()==WL_CONNECTED?UI_GREEN:UI_GREY,UI_BG); c.setTextSize(1); c.setCursor(8,9); c.print("WiFi");
+  c.setTextColor(TFT_WHITE,UI_BG); c.setCursor(42,9); c.print("AWC RADIO");
+  c.setTextColor(btStartedForAudio && bluetooth.is_connected()?UI_BLUE:UI_GREY,UI_BG); c.setCursor(151,9); c.print("BT");
+  c.setTextColor(streamOK && playing?UI_GREEN:UI_GREY,UI_BG); c.setCursor(176,9); c.print(streamOK && playing?"LIVE":"IDLE");
   int bat=M5.Power.getBatteryLevel(); bool charging=M5.Power.isCharging();
-  uint16_t bc=bat<15?TFT_RED:bat<30?GOLD:GREEN;
+  uint16_t bc=bat<15?TFT_RED:bat<30?UI_GOLD:UI_GREEN;
   c.drawRect(220,7,20,10,bc); c.fillRect(240,10,2,4,bc);
   c.fillRect(222,9,constrain(bat,0,100)*16/100,6,bc);
-  c.setTextColor(bc,BG); c.setCursor(245,9); if(charging)c.print("+"); if(bat>=0)c.printf("%d%%",bat); else c.print("--");
-  c.setTextColor(GREY,BG); c.setCursor(296,9); c.print("SET");
+  c.setTextColor(bc,UI_BG); c.setCursor(245,9); if(charging)c.print("+"); if(bat>=0)c.printf("%d%%",bat); else c.print("--");
+  c.setTextColor(UI_GREY,UI_BG); c.setCursor(296,9); c.print("SET");
   c.drawFastHLine(8,28,304,0x3186);
   if(logoOK) logoCanvas.pushSprite(&c,8,38);
-  else { c.fillRoundRect(8,38,94,94,8,0x2104); c.setTextColor(GOLD); c.setCursor(25,78); c.print("RADIO"); }
-  c.setTextSize(1); c.setTextColor(GREY,BG); c.setCursor(110,43); c.print(stationCount?stationNames[stationIndex].substring(0,33):"Loading stations");
-  c.setTextSize(2); c.setTextColor(TFT_WHITE,BG); c.setCursor(110,64);
+  else { c.fillRoundRect(8,38,94,94,8,0x2104); c.setTextColor(UI_GOLD); c.setCursor(25,78); c.print("RADIO"); }
+  c.setTextSize(1); c.setTextColor(UI_GREY,UI_BG); c.setCursor(110,43); c.print(stationCount?stationNames[stationIndex].substring(0,33):"Loading stations");
+  c.setTextSize(2); c.setTextColor(TFT_WHITE,UI_BG); c.setCursor(110,64);
   String t=title.length()?title:"Waiting...";
   if(t.length()>17) { int offset=(millis()/350)%(t.length()+4); t=(t+"    "+t).substring(offset,offset+17); }
   c.print(t.substring(0,17));
-  c.setTextSize(1); c.setTextColor(GREY,BG); c.setCursor(110,98); c.print(artist.substring(0,33));
+  c.setTextSize(1); c.setTextColor(UI_GREY,UI_BG); c.setCursor(110,98); c.print(artist.substring(0,33));
   int duration=max(0,(int)(trackEnd-trackStart));
   bool timed=duration>0 && time(nullptr)>1700000000;
   int elapsed=timed?constrain((int)(elapsedBase+(millis()-metadataAt)/1000),0,duration):0;
   c.fillRoundRect(8,140,304,4,2,0x3186);
-  if(timed && elapsed) c.fillRoundRect(8,140,304*elapsed/duration,4,2,GOLD);
+  if(timed && elapsed) c.fillRoundRect(8,140,304*elapsed/duration,4,2,UI_GOLD);
   c.setCursor(8,151); c.print(timed?clockText(elapsed):"--:--");
   c.setCursor(276,151); c.print(duration?clockText(duration):"--:--");
   // Five large touch targets, matching the reference.
   c.fillTriangle(32,180,32,202,18,191,TFT_WHITE); c.fillRect(15,180,3,22,TFT_WHITE);
   bool fav=stationCount && (favorites&(1ULL<<stationIndex));
-  for(int i=0;i<10;i++) { float a=-PI/2+i*PI/5,b=-PI/2+(i+1)*PI/5; int r=i%2?6:13,rr=(i+1)%2?6:13; c.drawLine(88+cos(a)*r,191+sin(a)*r,88+cos(b)*rr,191+sin(b)*rr,fav?GOLD:GREY); }
-  c.fillCircle(160,191,21,GOLD);
-  if(playing) {c.fillRect(153,183,5,16,BG);c.fillRect(162,183,5,16,BG);} else c.fillTriangle(154,181,154,201,169,191,BG);
+  for(int i=0;i<10;i++) { float a=-PI/2+i*PI/5,b=-PI/2+(i+1)*PI/5; int r=i%2?6:13,rr=(i+1)%2?6:13; c.drawLine(88+cos(a)*r,191+sin(a)*r,88+cos(b)*rr,191+sin(b)*rr,fav?UI_GOLD:UI_GREY); }
+  c.fillCircle(160,191,21,UI_GOLD);
+  if(playing) {c.fillRect(153,183,5,16,UI_BG);c.fillRect(162,183,5,16,UI_BG);} else c.fillTriangle(154,181,154,201,169,191,UI_BG);
   for(int i=0;i<3;i++) c.fillRoundRect(221,181+i*8,22-i*4,3,1,TFT_WHITE);
   c.fillTriangle(287,180,287,202,301,191,TFT_WHITE); c.fillRect(301,180,3,22,TFT_WHITE);
-  c.setTextColor(GREY,BG); c.setCursor(8,224); c.print("Next up: "+nextTitle.substring(0,41));
+  c.setTextColor(UI_GREY,UI_BG); c.setCursor(8,224); c.print("Next up: "+nextTitle.substring(0,41));
   c.pushSprite(0,0);
 }
 
