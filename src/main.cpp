@@ -332,6 +332,9 @@ static void configureDevice() {
 
 
 static BluetoothA2DPSource bluetooth;
+static bool btStartedForAudio=false;
+static unsigned long lastBTAttempt=0;
+static volatile bool liveSwitching=false;
 static SemaphoreHandle_t audioMutex;
 static Frame *pcmRing = nullptr;
 static constexpr size_t RING_FRAMES = 32768; // 128 KB PSRAM, ~0.74 s PCM
@@ -411,7 +414,7 @@ static void decoded(MP3FrameInfo &info, short *samples, size_t count, void *) {
 static void networkTask(void *) {
   uint8_t chunk[2048];
   while (true) {
-    if (!btEnabled || !playing || stationCount == 0 || WiFi.status() != WL_CONNECTED) {
+    if (liveSwitching || !btEnabled || !playing || stationCount == 0 || WiFi.status() != WL_CONNECTED) {
       vTaskDelay(pdMS_TO_TICKS(300));
       continue;
     }
@@ -493,6 +496,59 @@ static void selectStation(int change) {
   Serial.printf("Station: %s\n", stationNames[stationIndex].c_str());
 }
 
+// Live switching uses the running A2DP stack; discovery/add/forget stays in setup.
+
+static void liveBluetooth() {
+  int page=0;
+  while(true) {
+    heading("Switch Bluetooth");
+    for(int i=0;i<4 && page+i<savedCount;i++) {
+      int idx=page+i;
+      keyBox(4,35+i*40,312,40,String(idx==selectedBT && btEnabled?"* ":"")+String(savedBT[idx].name).substring(0,40));
+    }
+    keyBox(0,200,55,40,"PREV"); keyBox(55,200,55,40,"NEXT"); keyBox(110,200,105,40,"DISCONNECT"); keyBox(215,200,105,40,"BACK");
+    int x,y; tap(x,y);
+    int target=-2;
+    if(y>=200) {
+      if(x<55) page=max(0,page-4);
+      else if(x<110) { if(page+4<savedCount) page+=4; }
+      else if(x<215) target=-1;
+      else return;
+    } else if(y>=35 && y<195 && page+(y-35)/40<savedCount) target=page+(y-35)/40;
+    if(target==-2) continue;
+    if(target>=0 && !hasAddr(savedBT[target].addr)) {
+      heading("Scan device in setup"); delay(1500); continue;
+    }
+    if(target==selectedBT && btEnabled && btStartedForAudio && bluetooth.is_connected()) return;
+    liveSwitching=true;
+    ++generation; clearAudio();
+    heading("Switching receiver");
+    if(btStartedForAudio) {
+      bluetooth.set_auto_reconnect(false);
+      bluetooth.disconnect();
+      unsigned long start=millis();
+      while(bluetooth.is_connected() && millis()-start<8000) delay(50);
+      if(bluetooth.is_connected()) { liveSwitching=false; heading("Disconnect timed out"); delay(1500); return; }
+      delay(500);
+    }
+    btEnabled=target>=0;
+    if(target>=0) { selectedBT=target; btName=savedBT[target].name; }
+    prefs.begin("awc-radio",false); saveBT(); prefs.putString("bt",btName); prefs.end();
+    if(btEnabled) {
+      if(!btStartedForAudio) {
+        bluetooth.set_data_callback_in_frames(bluetoothFrames);
+        bluetooth.set_ssid_callback(matchSaved);
+        bluetooth.set_auto_reconnect(savedBT[selectedBT].addr);
+        bluetooth.start(btName.c_str());
+        btStartedForAudio=true;
+      } else {
+        bluetooth.set_auto_reconnect(savedBT[selectedBT].addr);
+        bluetooth.connect_to(savedBT[selectedBT].addr);
+      }
+    }
+    lastBTAttempt=millis(); liveSwitching=false; return;
+  }
+}
 static void drawScreen() {
   auto &d = M5.Display;
   d.fillScreen(TFT_BLACK);
@@ -501,6 +557,7 @@ static void drawScreen() {
   d.setCursor(12, 12);
   d.print("AWC RADIO");
   keyBox(244,4,76,32,"SETTINGS");
+  keyBox(174,4,70,32,"BT SWITCH");
   d.setTextColor(TFT_WHITE, TFT_BLACK);
   d.setCursor(12, 48);
   d.print(stationCount ? stationNames[stationIndex] : "Loading stations...");
@@ -551,6 +608,7 @@ void setup() {
     if(selectedBT>=0 && hasAddr(savedBT[selectedBT].addr)) bluetooth.set_auto_reconnect(savedBT[selectedBT].addr);
     else bluetooth.set_auto_reconnect(false);
     bluetooth.start(btName.c_str());
+    btStartedForAudio=true;
   }
   playing = stationCount > 0;
   xTaskCreatePinnedToCore(networkTask, "AWCStream", 12000, nullptr, 1, nullptr, 1);
@@ -559,6 +617,9 @@ void setup() {
 
 void loop() {
   M5.update();
+  if(btEnabled && btStartedForAudio && selectedBT>=0 && hasAddr(savedBT[selectedBT].addr) && !bluetooth.is_connected() && !bluetooth.is_discovery_active() && millis()-lastBTAttempt>15000) {
+    lastBTAttempt=millis(); bluetooth.connect_to(savedBT[selectedBT].addr);
+  }
   if (WiFi.status() != WL_CONNECTED) {
     static unsigned long lastWiFiRetry = 0;
     if (millis() - lastWiFiRetry > 10000) {
@@ -576,6 +637,7 @@ void loop() {
   if (M5.Touch.getCount()) {
     auto detail = M5.Touch.getDetail(0);
     if (detail.wasPressed()) {
+      if (detail.y < 35 && detail.x >= 174 && detail.x < 244) { liveBluetooth(); drawScreen(); }
       if (detail.y < 35 && detail.x >= 244) {
         prefs.begin("awc-radio",false); prefs.putBool("setup",true); prefs.end(); ESP.restart();
       }
