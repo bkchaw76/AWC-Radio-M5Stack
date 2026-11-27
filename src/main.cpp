@@ -211,7 +211,9 @@ static void wifiManager() {
     saveWifi();
   }
 }
+static unsigned long wifiAttemptAt=0;
 static void connectSavedWifi(bool rotate) {
+  wifiAttemptAt=millis();
   if(wifiCount) {
     if(rotate) wifiIndex=(wifiIndex+1)%wifiCount;
     wifiName=savedSSID[wifiIndex]; wifiPassword=savedPass[wifiIndex];
@@ -408,7 +410,7 @@ static void configureDevice() {
   // Hold the touchscreen during startup to reopen setup.
   delay(600);
   M5.update();
-  if (wifiName != "YOUR_IPHONE_HOTSPOT" && (!btEnabled || btName != "YOUR_CAR_BLUETOOTH_NAME") && !M5.Touch.getCount() && !forceSetup) {
+  if (wifiName.length() && wifiName != "YOUR_IPHONE_HOTSPOT" && (!btEnabled || btName != "YOUR_CAR_BLUETOOTH_NAME") && !M5.Touch.getCount() && !forceSetup) {
     prefs.end();
     return;
   }
@@ -434,7 +436,10 @@ static void configureDevice() {
       setupServer.send(400, "text/plain", "SSID, Bluetooth name and http:// server URL required");
       return;
     }
-    wifiCount=1; wifiIndex=0; savedSSID[0]=setupServer.arg("ssid"); savedPass[0]=setupServer.arg("password"); saveWifi();
+    int n=0; while(n<wifiCount && savedSSID[n]!=setupServer.arg("ssid")) n++;
+    if(n>=6) { setupServer.send(400,"text/plain","Wi-Fi list full; forget a network on the LCD first"); return; }
+    if(n==wifiCount) wifiCount++;
+    wifiIndex=n; savedSSID[n]=setupServer.arg("ssid"); savedPass[n]=setupServer.arg("password"); saveWifi();
     prefs.putString("bt", setupServer.arg("bt"));
     selectedBT=-1; btEnabled=true; saveBT();
     prefs.putString("url", url); prefs.remove("ruser"); prefs.remove("rpass");
@@ -479,7 +484,7 @@ static bool logoDirty=true, logoOK=false;
 static unsigned long logoRetryAt=0;
 static M5Canvas logoCanvas(&M5.Display);
 static unsigned long lastMetadata = 0, lastScreen = 0;
-static bool streamOK = false;
+static volatile bool streamOK = false;
 
 static String encoded(const String &s) {
   const char hex[] = "0123456789ABCDEF";
@@ -596,10 +601,11 @@ static void networkTask(void *) {
 }
 
 static bool readJson(const String &path, JsonDocument &doc) {
+  WiFiClient plain; WiFiClientSecure tls;
   HTTPClient http;
   http.useHTTP10(true);
+  http.setConnectTimeout(5000);
   http.setTimeout(5000);
-  WiFiClient plain; WiFiClientSecure tls;
   if (!beginRadio(http,plain,tls,endpoint(path))) return false;
   const int status = http.GET();
   if (status != HTTP_CODE_OK) { http.end(); return false; }
@@ -632,7 +638,7 @@ static void refreshMetadata() {
     artist = doc["artist"].as<String>();
     nextTitle=doc["next_song"]["title"] | "";
     trackStart=doc["start"] | 0.0; trackEnd=doc["end"] | 0.0;
-    // HTTP Date supplies server wall clock without requiring NTP.
+    // Elapsed time uses the NTP-synchronized device clock.
     elapsedBase=0; metadataAt=millis();
     time_t now=time(nullptr); if(now>1700000000) elapsedBase=max(0.0,(double)now-trackStart);
   }
@@ -740,8 +746,8 @@ static void fetchLogo() {
   if(loadCachedLogo(path)) { logoOK=true; logoDirty=false; return; }
   if(WiFi.status()!=WL_CONNECTED) { logoRetryAt=millis()+5000; return; }
   logoRetryAt=millis()+15000;
-  HTTPClient http; http.useHTTP10(true); http.setTimeout(2500);
   WiFiClient plain; WiFiClientSecure tls;
+  HTTPClient http; http.useHTTP10(true); http.setConnectTimeout(3000); http.setTimeout(2500);
   if(!beginRadio(http,plain,tls,endpoint("/api/logo/"+encoded(stationNames[stationIndex])))) return;
   if(http.GET()==200) {
     int len=http.getSize();
@@ -1040,7 +1046,7 @@ void loop() {
   }
   if (WiFi.status() != WL_CONNECTED) {
     static unsigned long lastWiFiRetry = 0;
-    if (millis() - lastWiFiRetry > 15000) {
+    if (millis() - lastWiFiRetry > 15000 && millis()-wifiAttemptAt>=15000) {
       lastWiFiRetry = millis();
       WiFi.disconnect(false); connectSavedWifi(true);
     }
@@ -1072,7 +1078,7 @@ void loop() {
       drawScreen();
     }
   }
-  if (millis() - lastMetadata > 5000 && stationCount) {
+  if (millis() - lastMetadata > 5000 && stationCount && WiFi.status()==WL_CONNECTED) {
     lastMetadata = millis();
     refreshMetadata();
   }
