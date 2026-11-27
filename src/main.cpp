@@ -1,6 +1,8 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <Preferences.h>
+#include <WebServer.h>
 #include <ArduinoJson.h>
 #include <M5Unified.h>
 #include <BluetoothA2DPSource.h>
@@ -25,6 +27,57 @@
 #endif
 
 using libhelix::MP3DecoderHelix;
+static String wifiName, wifiPassword, btName, radioURL;
+static Preferences prefs;
+static WebServer setupServer(80);
+
+static void configureDevice() {
+  prefs.begin("awc-radio", false);
+  wifiName = prefs.getString("ssid", WIFI_SSID);
+  wifiPassword = prefs.getString("password", WIFI_PASSWORD);
+  btName = prefs.getString("bt", BT_SPEAKER_NAME);
+  radioURL = prefs.getString("url", RADIO_SERVER_URL);
+  // Hold the touchscreen during startup to reopen setup.
+  delay(600);
+  M5.update();
+  if (wifiName != "YOUR_IPHONE_HOTSPOT" && btName != "YOUR_CAR_BLUETOOTH_NAME" && !M5.Touch.getCount()) {
+    prefs.end();
+    return;
+  }
+  WiFi.mode(WIFI_AP);
+  String apPassword = String((uint32_t)esp_random(), HEX);
+  while (apPassword.length() < 8) apPassword = "0" + apPassword;
+  WiFi.softAP("AWC-Radio-Setup", apPassword.c_str());
+  M5.Display.fillScreen(TFT_BLACK);
+  M5.Display.setTextSize(2);
+  M5.Display.setCursor(8, 10);
+  M5.Display.println("AWC Radio Setup");
+  M5.Display.println("AWC-Radio-Setup");
+  M5.Display.println("Password:");
+  M5.Display.println(apPassword);
+  M5.Display.println("192.168.4.1");
+  setupServer.on("/", HTTP_GET, []() {
+    setupServer.send(200, "text/html", R"HTML(<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><h2>AWC Radio setup</h2><form method="post" action="/save"><p>Wi-Fi SSID<br><input name="ssid" required></p><p>Wi-Fi password<br><input name="password" type="password"></p><p>Bluetooth head unit name<br><input name="bt" required></p><p>Radio server URL<br><input name="url" type="url" value="http://192.168.8.8:8088" required></p><button>Save and restart</button></form>)HTML");
+  });
+  setupServer.on("/save", HTTP_POST, []() {
+    String url = setupServer.arg("url");
+    if (!setupServer.arg("ssid").length() || !setupServer.arg("bt").length() || !url.startsWith("http://")) {
+      setupServer.send(400, "text/plain", "SSID, Bluetooth name and http:// server URL required");
+      return;
+    }
+    prefs.putString("ssid", setupServer.arg("ssid"));
+    prefs.putString("password", setupServer.arg("password"));
+    prefs.putString("bt", setupServer.arg("bt"));
+    prefs.putString("url", url);
+    setupServer.send(200, "text/plain", "Saved. Restarting...");
+    delay(500);
+    prefs.end();
+    ESP.restart();
+  });
+  setupServer.begin();
+  while (true) { setupServer.handleClient(); delay(10); }
+}
+
 
 static BluetoothA2DPSource bluetooth;
 static SemaphoreHandle_t audioMutex;
@@ -52,7 +105,7 @@ static String encoded(const String &s) {
 }
 
 static String endpoint(const String &path) {
-  String base = RADIO_SERVER_URL;
+  String base = radioURL;
   while (base.endsWith("/")) base.remove(base.length() - 1);
   return base + path;
 }
@@ -203,7 +256,7 @@ static void drawScreen() {
   d.print(artist.substring(0, 45));
   d.setCursor(12, 145);
   d.printf("WiFi: %s  BT: %s", WiFi.status() == WL_CONNECTED ? "OK" : "OFF",
-           BT_SPEAKER_NAME);
+           btName.c_str());
   d.setCursor(12, 164);
   d.printf("Audio: %s", streamOK ? "streaming" : "waiting");
   d.drawLine(0, 189, 320, 189, TFT_DARKGREY);
@@ -220,6 +273,7 @@ void setup() {
   M5.begin(config);
   M5.Display.setRotation(1);
   M5.Display.setBrightness(110);
+  configureDevice();
 
   audioMutex = xSemaphoreCreateMutex();
   pcmRing = (Frame *)ps_malloc(RING_FRAMES * sizeof(Frame));
@@ -230,7 +284,7 @@ void setup() {
   }
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  WiFi.begin(wifiName.c_str(), wifiPassword.c_str());
   Serial.println("Connecting WiFi...");
   const unsigned long start = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) delay(250);
@@ -238,7 +292,7 @@ void setup() {
 
   bluetooth.set_data_callback_in_frames(bluetoothFrames);
   bluetooth.set_auto_reconnect(true);
-  bluetooth.start(BT_SPEAKER_NAME);
+  bluetooth.start(btName.c_str());
   playing = stationCount > 0;
   xTaskCreatePinnedToCore(networkTask, "AWCStream", 12000, nullptr, 1, nullptr, 1);
   drawScreen();
