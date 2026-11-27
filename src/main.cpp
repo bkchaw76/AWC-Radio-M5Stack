@@ -7,10 +7,10 @@
 #include "AudioTools/Communication/AudioHttp.h"
 #include "MP3DecoderHelix.h"
 // Local credentials override the public example (which never contains secrets).
-#if __has_include("config.h")
-#include "config.h"
+#if __has_include("../include/config.h")
+#include "../include/config.h"
 #else
-#include "config.example.h"
+#include "../include/config.example.h"
 #endif
 
 using audio_tools::URLStream;
