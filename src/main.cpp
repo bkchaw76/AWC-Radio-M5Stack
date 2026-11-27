@@ -6,6 +6,10 @@
 #include <ArduinoJson.h>
 #include <M5Unified.h>
 #include <BluetoothA2DPSource.h>
+#include <esp_bt.h>
+#include <esp_bt_main.h>
+#include <esp_gap_bt_api.h>
+#include <esp32-hal-bt.h>
 #include "MP3DecoderHelix.h"
 // Local credentials override the public example (which never contains secrets).
 #if __has_include("../include/config.h")
@@ -98,6 +102,91 @@ static String chooseWifi() {
     }
   }
 }
+// Setup runs before A2DP starts. Use Classic GAP inquiry, then reboot
+// into the normal A2DP player after saving the selected receiver.
+struct FoundBT { char name[249]; uint8_t addr[6]; int rssi; };
+static FoundBT foundBT[24];
+static int foundCount=0;
+static portMUX_TYPE scanMux=portMUX_INITIALIZER_UNLOCKED;
+static volatile bool inquiryDone=false;
+static void gapScan(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *p) {
+  if(event==ESP_BT_GAP_DISC_STATE_CHANGED_EVT) {
+    if(p->disc_st_chg.state==ESP_BT_GAP_DISCOVERY_STOPPED) inquiryDone=true;
+    return;
+  }
+  if(event!=ESP_BT_GAP_DISC_RES_EVT) return;
+  char name[249]={};
+  int rssi=-127;
+  uint32_t cod=0;
+  bool hasCod=false;
+  for(int i=0;i<p->disc_res.num_prop;i++) {
+    auto &prop=p->disc_res.prop[i];
+    if(prop.type==ESP_BT_GAP_DEV_PROP_BDNAME) memcpy(name,prop.val,min((int)prop.len,248));
+    else if(prop.type==ESP_BT_GAP_DEV_PROP_RSSI) rssi=*(int8_t*)prop.val;
+    else if(prop.type==ESP_BT_GAP_DEV_PROP_COD && prop.len>=4) { memcpy(&cod,prop.val,4); hasCod=true; }
+    else if(prop.type==ESP_BT_GAP_DEV_PROP_EIR && !name[0]) {
+      uint8_t len=0;
+      uint8_t *n=esp_bt_gap_resolve_eir_data((uint8_t*)prop.val,ESP_BT_EIR_TYPE_CMPL_LOCAL_NAME,&len);
+      if(!n) n=esp_bt_gap_resolve_eir_data((uint8_t*)prop.val,ESP_BT_EIR_TYPE_SHORT_LOCAL_NAME,&len);
+      if(n) memcpy(name,n,min((int)len,248));
+    }
+  }
+  if(!name[0]) return;
+  // Audio/video major class or rendering service; keep unknown class devices.
+  if(hasCod && cod && ((cod>>8)&31)!=4 && !(cod & (1UL<<18))) return;
+  portENTER_CRITICAL(&scanMux);
+  int idx=0;
+  while(idx<foundCount && memcmp(foundBT[idx].addr,p->disc_res.bda,6)) idx++;
+  if(idx<24) {
+    if(idx==foundCount) foundCount++;
+    memcpy(foundBT[idx].addr,p->disc_res.bda,6);
+    memcpy(foundBT[idx].name,name,sizeof(name));
+    foundBT[idx].rssi=rssi;
+  }
+  portEXIT_CRITICAL(&scanMux);
+}
+static String chooseBluetooth() {
+  if(!btStarted() && !btStart()) return keyboard("Bluetooth name",btName);
+  if(esp_bluedroid_get_status()==ESP_BLUEDROID_STATUS_UNINITIALIZED && esp_bluedroid_init()!=ESP_OK) return keyboard("Bluetooth name",btName);
+  if(esp_bluedroid_get_status()==ESP_BLUEDROID_STATUS_INITIALIZED && esp_bluedroid_enable()!=ESP_OK) return keyboard("Bluetooth name",btName);
+  if(esp_bt_gap_register_callback(gapScan)!=ESP_OK) return keyboard("Bluetooth name",btName);
+  while(true) {
+    heading("Scanning Bluetooth");
+    M5.Display.setTextSize(1); M5.Display.setCursor(8,42); M5.Display.print("Put receiver in pairing mode");
+    portENTER_CRITICAL(&scanMux); foundCount=0; portEXIT_CRITICAL(&scanMux);
+    inquiryDone=false;
+    if(esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY,8,0)==ESP_OK) {
+      unsigned long start=millis();
+      while(!inquiryDone && millis()-start<13000) { M5.update(); delay(50); }
+      if(!inquiryDone) { esp_bt_gap_cancel_discovery(); delay(500); }
+    }
+    int page=0;
+    while(true) {
+      heading("Bluetooth devices");
+      int n;
+      portENTER_CRITICAL(&scanMux); n=foundCount; portEXIT_CRITICAL(&scanMux);
+      if(!n) { M5.Display.setTextSize(1); M5.Display.setCursor(8,50); M5.Display.print("No named audio devices found"); }
+      for(int i=0;i<4 && page+i<n;i++) {
+        FoundBT item;
+        portENTER_CRITICAL(&scanMux); item=foundBT[page+i]; portEXIT_CRITICAL(&scanMux);
+        keyBox(4,35+i*40,312,40,String(item.name).substring(0,40)+" "+String(item.rssi));
+      }
+      keyBox(0,200,60,40,"PREV"); keyBox(60,200,60,40,"NEXT"); keyBox(120,200,70,40,"SCAN"); keyBox(190,200,70,40,"MANUAL"); keyBox(260,200,60,40,"BACK");
+      int x,y; tap(x,y);
+      if(y>=200) {
+        if(x<60) page=max(0,page-4);
+        else if(x<120) { if(page+4<n) page+=4; }
+        else if(x<190) break;
+        else if(x<260) return keyboard("Bluetooth name",btName=="YOUR_CAR_BLUETOOTH_NAME"?"":btName);
+        else return btName;
+      } else if(y>=35 && y<195 && page+(y-35)/40<n) {
+        FoundBT item;
+        portENTER_CRITICAL(&scanMux); item=foundBT[page+(y-35)/40]; portEXIT_CRITICAL(&scanMux);
+        return String(item.name);
+      }
+    }
+  }
+}
 static bool lcdSetup() {
   while(true) {
     heading("AWC Radio Settings");
@@ -108,7 +197,7 @@ static bool lcdSetup() {
     keyBox(4,195,312,42,"Phone setup (optional)");
     int x,y; tap(x,y);
     if(y>=35 && y<75) { wifiName=chooseWifi(); wifiPassword=keyboard("Wi-Fi password","",true); }
-    else if(y>=75 && y<115) btName=keyboard("Bluetooth name",btName=="YOUR_CAR_BLUETOOTH_NAME"?"":btName);
+    else if(y>=75 && y<115) btName=chooseBluetooth();
     else if(y>=115 && y<155) radioURL=keyboard("Radio server URL",radioURL);
     else if(y>=155 && y<195) {
       if(!wifiName.length() || wifiName=="YOUR_IPHONE_HOTSPOT" || !btName.length() || btName=="YOUR_CAR_BLUETOOTH_NAME" || !radioURL.startsWith("http://")) { heading("Check settings"); delay(1200); continue; }
