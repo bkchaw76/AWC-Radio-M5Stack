@@ -29,11 +29,34 @@ jobs:
           cp .pio/build/m5stack-core2/firmware.bin dist/firmware.bin
           cp .pio/build/m5stack-core2/bootloader.bin dist/bootloader.bin
           cp .pio/build/m5stack-core2/partitions.bin dist/partitions.bin
+          cp ~/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin dist/
+          python ~/.platformio/packages/tool-esptoolpy/esptool.py --chip esp32 merge_bin -o dist/AWC-Radio-Core2-Full.bin --flash_mode dio --flash_freq 40m --flash_size 16MB 0x1000 dist/bootloader.bin 0x8000 dist/partitions.bin 0xe000 dist/boot_app0.bin 0x10000 dist/firmware.bin
           cat > dist/FLASH.txt <<'EOF'
-          For an initial USB flash use:
-          pio run -t upload
-          For direct flashing, obtain the flashing offsets from PlatformIO's build output.
-          Do not flash only firmware.bin at address 0x0000.
+          M5Stack Core2 / Core2 v1.3 only.
+          Flash AWC-Radio-Core2-Full.bin at 0x0000 using ESP32, DIO, 40 MHz, 16 MB.
+          This replaces the bootloader, partition table and application.
+          Back up existing firmware/data before flashing.
+          Application-only update: firmware.bin at 0x10000, only with matching partitions.
+          Windows: install Python 3, then run Flash-Windows.bat.
+          EOF
+          cat > dist/Flash-Windows.bat <<'EOF'
+          @echo off
+          cd /d "%~dp0"
+          py -3 -m pip install "esptool>=4.8,<5" || goto fail
+          py -3 -m serial.tools.list_ports
+          set /p PORT=Enter Core2 COM port (e.g. COM5): 
+          if not defined PORT goto fail
+          echo This replaces the existing firmware. Back up first.
+          choice /M "Continue flashing"
+          if errorlevel 2 exit /b 1
+          py -3 -m esptool --chip esp32 --port "%PORT%" --baud 460800 write_flash 0x0000 AWC-Radio-Core2-Full.bin || goto fail
+          echo Flash successful. Reset the Core2.
+          pause
+          exit /b 0
+          :fail
+          echo Flash failed or cancelled.
+          pause
+          exit /b 1
           EOF
       - uses: actions/upload-artifact@v4
         with:
