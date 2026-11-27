@@ -105,6 +105,72 @@ static String chooseWifi() {
     }
   }
 }
+static String savedSSID[6], savedPass[6];
+static int wifiCount=0, wifiIndex=0;
+static void loadWifi() {
+  wifiCount=constrain(prefs.getInt("wcount",0),0,6);
+  for(int i=0;i<wifiCount;i++) {
+    savedSSID[i]=prefs.getString(("ws"+String(i)).c_str(),"");
+    savedPass[i]=prefs.getString(("wp"+String(i)).c_str(),"");
+  }
+  if(!wifiCount && wifiName.length() && wifiName!="YOUR_IPHONE_HOTSPOT") {
+    savedSSID[0]=wifiName; savedPass[0]=wifiPassword; wifiCount=1;
+  }
+  wifiIndex=constrain(prefs.getInt("windex",0),0,max(0,wifiCount-1));
+}
+static void saveWifi() {
+  prefs.putInt("wcount",wifiCount); prefs.putInt("windex",wifiIndex);
+  for(int i=0;i<6;i++) {
+    String sk="ws"+String(i), pk="wp"+String(i);
+    if(i<wifiCount) { prefs.putString(sk.c_str(),savedSSID[i]); prefs.putString(pk.c_str(),savedPass[i]); }
+    else { prefs.remove(sk.c_str()); prefs.remove(pk.c_str()); }
+  }
+  if(wifiCount) { wifiName=savedSSID[wifiIndex]; wifiPassword=savedPass[wifiIndex]; }
+  else { wifiName=""; wifiPassword=""; }
+  prefs.putString("ssid",wifiName); prefs.putString("password",wifiPassword);
+}
+static void wifiManager() {
+  int page=0;
+  while(true) {
+    heading("Wi-Fi networks");
+    for(int i=0;i<4 && page+i<wifiCount;i++) {
+      int n=page+i;
+      keyBox(4,35+i*40,244,40,String(n==wifiIndex?"* ":"")+savedSSID[n]);
+      keyBox(248,35+i*40,72,40,"FORGET");
+    }
+    keyBox(0,200,60,40,"PREV"); keyBox(60,200,60,40,"NEXT"); keyBox(120,200,90,40,"ADD/EDIT"); keyBox(210,200,110,40,"BACK");
+    int x,y; tap(x,y);
+    if(y>=200) {
+      if(x<60) page=max(0,page-4);
+      else if(x<120) { if(page+4<wifiCount) page+=4; }
+      else if(x<210) {
+        String ssid=chooseWifi(); if(!ssid.length()) continue;
+        int n=0; while(n<wifiCount && savedSSID[n]!=ssid) n++;
+        if(n>=6) { heading("Forget a network first"); delay(1200); continue; }
+        String pw=keyboard("Wi-Fi password",n<wifiCount?savedPass[n]:"",true);
+        if(n==wifiCount) wifiCount++;
+        savedSSID[n]=ssid; savedPass[n]=pw; wifiIndex=n; page=(n/4)*4;
+      } else return;
+    } else if(y>=35 && y<195 && page+(y-35)/40<wifiCount) {
+      int n=page+(y-35)/40;
+      if(x>=248) {
+        heading("Forget network?"); keyBox(0,100,160,60,"CANCEL"); keyBox(160,100,160,60,"FORGET");
+        int cx,cy; tap(cx,cy); if(cx<160 || cy<100 || cy>=160) continue;
+        for(int i=n;i+1<wifiCount;i++) { savedSSID[i]=savedSSID[i+1]; savedPass[i]=savedPass[i+1]; }
+        wifiCount--; savedSSID[wifiCount]=""; savedPass[wifiCount]="";
+        if(wifiIndex>n) wifiIndex--; wifiIndex=constrain(wifiIndex,0,max(0,wifiCount-1)); page=0;
+      } else wifiIndex=n;
+    }
+    saveWifi();
+  }
+}
+static void connectSavedWifi(bool rotate) {
+  if(wifiCount) {
+    if(rotate) wifiIndex=(wifiIndex+1)%wifiCount;
+    wifiName=savedSSID[wifiIndex]; wifiPassword=savedPass[wifiIndex];
+  }
+  if(wifiName.length()) WiFi.begin(wifiName.c_str(),wifiPassword.c_str());
+}
 // Setup runs before A2DP starts. Use Classic GAP inquiry, then reboot
 // into the normal A2DP player after saving the selected receiver.
 struct FoundBT { char name[249]; uint8_t addr[6]; int rssi; };
@@ -272,7 +338,7 @@ static bool lcdSetup() {
     keyBox(4,155,312,38,"Save and restart");
     keyBox(4,195,312,42,"Phone setup (optional)");
     int x,y; tap(x,y);
-    if(y>=35 && y<75) { wifiName=chooseWifi(); wifiPassword=keyboard("Wi-Fi password","",true); }
+    if(y>=35 && y<75) wifiManager();
     else if(y>=75 && y<115) manageBluetooth();
     else if(y>=115 && y<155) radioURL=keyboard("Radio server URL",radioURL);
     else if(y>=155 && y<195) {
@@ -286,6 +352,7 @@ static void configureDevice() {
   prefs.begin("awc-radio", false);
   wifiName = prefs.getString("ssid", WIFI_SSID);
   wifiPassword = prefs.getString("password", WIFI_PASSWORD);
+  loadWifi();
   btName = prefs.getString("bt", BT_SPEAKER_NAME);
   loadBT();
   radioURL = prefs.getString("url", RADIO_SERVER_URL);
@@ -319,8 +386,7 @@ static void configureDevice() {
       setupServer.send(400, "text/plain", "SSID, Bluetooth name and http:// server URL required");
       return;
     }
-    prefs.putString("ssid", setupServer.arg("ssid"));
-    prefs.putString("password", setupServer.arg("password"));
+    wifiCount=1; wifiIndex=0; savedSSID[0]=setupServer.arg("ssid"); savedPass[0]=setupServer.arg("password"); saveWifi();
     prefs.putString("bt", setupServer.arg("bt"));
     selectedBT=-1; btEnabled=true; saveBT();
     prefs.putString("url", url);
@@ -713,7 +779,7 @@ static void powerTick() {
       seenUSB=true; usbLostAt=0;
       if(standby) {
         standby=false; screenOff=false; lastTouch=now;
-        WiFi.mode(WIFI_STA); WiFi.begin(wifiName.c_str(),wifiPassword.c_str());
+        WiFi.mode(WIFI_STA); connectSavedWifi(false);
         playing=resumePlaying; ++generation; clearAudio(); applyBrightness();
       }
     } else if(mv<4000 && seenUSB && !standby) {
@@ -795,7 +861,7 @@ void setup() {
   }
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
-  WiFi.begin(wifiName.c_str(), wifiPassword.c_str());
+  connectSavedWifi(false);
   configTime(0,0,"pool.ntp.org","time.google.com");
   Serial.println("Connecting WiFi...");
   const unsigned long start = millis();
@@ -824,9 +890,9 @@ void loop() {
   }
   if (WiFi.status() != WL_CONNECTED) {
     static unsigned long lastWiFiRetry = 0;
-    if (millis() - lastWiFiRetry > 10000) {
+    if (millis() - lastWiFiRetry > 15000) {
       lastWiFiRetry = millis();
-      WiFi.reconnect();
+      WiFi.disconnect(false); connectSavedWifi(true);
     }
   } else if (!stationCount) {
     static unsigned long lastLookup = 0;
